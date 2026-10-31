@@ -502,7 +502,11 @@ class Assembler:
 
         if fmt is Fmt.RS:
             r1 = self.reg(ops[0]) if ops else 0
-            r3 = self.reg(ops[1]) if len(ops) > 1 else 0
+            if name in ("ICM", "STCM", "CLM"):
+                # The second field is a 4-bit byte mask, not a register.
+                r3 = self.eval(ops[1], current) & 0xF if len(ops) > 1 else 0
+            else:
+                r3 = self.reg(ops[1]) if len(ops) > 1 else 0
             d, _x, b = self.parse_dxbr(ops[2] if len(ops) > 2 else "0", current, False)
             return encode(name, r1, r3, b, d)
 

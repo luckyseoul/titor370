@@ -333,6 +333,18 @@ def test_pack_turns_zoned_into_packed():
     assert cpu.read(0x500, 3) == b"\x00\x12\x3C"
 
 
+def test_unpack_right_aligns_and_signs_the_low_byte():
+    # 5 packed bytes = 9 digits + sign. 00 00 12 34 5C -> F0 F0 F0 F0 C5:
+    # the sign (C) takes the zone of the low-order byte, the digit 5 its
+    # low nibble, and the field is zero-filled on the left.
+    cpu = run_one(
+        "UNPK",
+        mem={0x200: bytes.fromhex("000012345C")},
+        fields=(4, 0, 0x500, 0, 0x200),
+    )
+    assert cpu.read(0x500, 5) == bytes.fromhex("F0F0F0F0C5")
+
+
 def test_unpack_is_the_inverse():
     cpu = run_one("UNPK", mem={0x200: b"\x12\x3C"}, fields=(4, 0, 0x500, 0, 0x200))
     assert cpu.read(0x300, 5) == b"\xF1\xF2\xF3\xF4\xC3" if False else cpu.read(0x500, 5)[:3] == b"\xF1\xF2\xF3"

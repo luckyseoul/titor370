@@ -1,0 +1,46 @@
+*        The awkward instructions: packed decimal conversion, zoned pack and
+*        unpack, byte-masked insert and store, 64-bit shifts, compare and swap.
+*        Its purpose is to make the interpreter and the C translator disagree
+*        if any of them is wrong.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+*        ---- CVD / CVB round trip ----
+         L     1,VALUE
+         CVD   1,PACKED
+         CVB   2,PACKED
+         ST    2,ROUND
+*        ---- PACK / UNPK round trip ----
+         PACK  P2(5),ZONED
+         UNPK  ZOUT(5),P2(5)
+         L     9,ONE
+*        ---- ICM / STCM ----
+NEXTSEC  ICM   3,0xC,SRC
+         STCM  3,0x5,DST
+*        ---- 64-bit shift ----
+         L     4,HIGH
+         L     5,LOW
+         SLDL  4,4
+         STM   4,5,SHIFTED
+*        ---- compare and swap ----
+         L     6,EXPECT
+         L     8,REPLACE
+         CS    6,8,TARGET
+         DIAG  0,0,0
+VALUE    DC    F'-1234'
+NEGONE   DC    F'-1'
+ONE      DC    F'1'
+EXPECT   DC    F'7'
+REPLACE  DC    F'9'
+TARGET   DC    F'7'
+HIGH     DC    F'1'
+LOW      DC    F'2'
+PACKED   DS    8C
+P2       DS    5C
+ZONED    DC    X'F1F2F3F4C5'
+ZOUT     DS    5C
+SRC      DC    X'AABBCCDD'
+DST      DS    4C
+SHIFTED  DS    8C
+ROUND    DS    F
+         END   START

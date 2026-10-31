@@ -1142,19 +1142,21 @@ class CPU:
     def op_UNPK(self, i: Instruction) -> None:
         """Packed -> zoned decimal, the inverse of PACK.
 
-        Each result byte carries 0xF in its zone, except the low-order byte,
-        whose high nibble receives the sign.
+        The result field is L+1 bytes = 2(L+1) nibbles: 2L+1 digits plus a sign
+        in the high nibble of the low-order byte. Digits are right-aligned and
+        the field is zero-filled on the left.
         """
         dest, src = self._ss_addrs(i)
         n_src = i.l + 1
         n_dst = i.l + 1
 
-        data = bytes(self.memory[src : src + n_src])
-        nibbles = []
-        for byte in data:
+        nibbles: list[int] = []
+        for k in range(n_src):
+            byte = self.memory[src + k]
             nibbles.append(byte >> 4)
             nibbles.append(byte & 0x0F)
         sign = nibbles.pop()
+
         capacity = 2 * n_dst - 1
         digits = nibbles[-capacity:] if capacity else []
         digits = [0] * (capacity - len(digits)) + digits

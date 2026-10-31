@@ -574,9 +574,9 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         return [
             f"{{ int64_t v = (int32_t)R[{r1}]; uint32_t a0 = {A}; unsigned neg = v < 0;"
             f" uint64_t mag = neg ? (uint64_t)(-v) : (uint64_t)v; uint8_t dg[16];"
-            f" for (int k = 15; k >= 0; k--) {{ dg[k] = (uint8_t)(mag % 10); mag /= 10; }}"
-            f" for (int k = 0; k < 7; k++) M[(a0 + k) & MASK24] = (uint8_t)((dg[2*k] << 4) | dg[2*k+1]);"
-            f" M[(a0 + 7) & MASK24] = (uint8_t)((dg[14] << 4) | (neg ? 0xD : 0xC)); }}",
+            f" for (int k = 14; k >= 0; k--) {{ dg[k] = (uint8_t)(mag % 10); mag /= 10; }}"
+            f" dg[15] = (uint8_t)(neg ? 0xD : 0xC);"
+            f" for (int k = 0; k < 8; k++) M[(a0 + k) & MASK24] = (uint8_t)((dg[2 * k] << 4) | dg[2 * k + 1]); }}",
             nxt,
         ]
 
@@ -593,29 +593,36 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name == "PACK":
+        # Right-aligned: low-order digits are kept, high-order positions are
+        # zero-filled, and any surplus high-order digits are discarded.
         return [
-            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L + 1}, nd = {L + 1};"
-            f" uint8_t nib[600]; int n = 0;"
-            f" for (int k = ns - 1; k >= 0; k--) nib[n++] = M[(s0 + k) & MASK24] & 0x0F;"
+            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L + 1}, nd = {L + 1}; int cap = 2 * nd - 1;"
+            f" uint8_t seq[600], nib[600]; int n = 0;"
+            f" for (int k = ns - 1; k >= 0; k--) seq[n++] = (uint8_t)(M[(s0 + k) & MASK24] & 0x0F);"
             f" uint8_t sign = (uint8_t)(M[(s0 + ns - 1) & MASK24] >> 4);"
-            f" int cap = 2 * nd - 1; if (n > cap) n = cap;"
-            f" uint8_t digits[600]; for (int k = 0; k < cap; k++) digits[k] = (k < n) ? nib[n - 1 - k] : 0;"
-            f" for (int k = 0; k < nd; k++) M[(d0 + k) & MASK24] = 0;"
-            f" for (int k = 0; k < nd; k++) {{ uint8_t hi = digits[2*k], lo = (2*k+1 < cap) ? digits[2*k+1] : sign;"
-            f" M[(d0 + k) & MASK24] = (uint8_t)((hi << 4) | lo); }}"
-            f" M[(d0 + nd - 1) & MASK24] = (uint8_t)((M[(d0 + nd - 1) & MASK24] & 0xF0u) | sign); }}",
+            f" if (n > cap) {{ memmove(seq, seq + (n - cap), (size_t)cap); n = cap; }}"
+            f" int off = cap - n;"
+            f" for (int k = 0; k < cap; k++) nib[k] = (k >= off) ? seq[n - 1 - (k - off)] : 0;"
+            f" nib[cap] = sign;"
+            f" for (int k = 0; k < nd; k++)"
+            f" M[(d0 + k) & MASK24] = (uint8_t)((nib[2 * k] << 4) | nib[2 * k + 1]); }}",
             nxt,
         ]
 
     if name == "UNPK":
+        # nib[0] is the most significant nibble, so digits keep their order;
+        # the sign replaces the zone of the low-order byte.
         return [
-            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L + 1}, nd = {L + 1};"
+            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L + 1}, nd = {L + 1}; int cap = 2 * nd - 1;"
             f" uint8_t nib[600]; int n = 0;"
-            f" for (int k = 0; k < ns; k++) {{ uint8_t b = M[(s0 + k) & MASK24]; nib[n++] = b >> 4; nib[n++] = b & 0x0F; }}"
-            f" uint8_t sign = nib[--n]; int cap = 2 * nd - 1;"
-            f" uint8_t digits[600]; for (int k = 0; k < cap; k++) digits[k] = (k < n) ? nib[n - 1 - k] : 0;"
+            f" for (int k = 0; k < ns; k++) {{ uint8_t b = M[(s0 + k) & MASK24];"
+            f" nib[n++] = (uint8_t)(b >> 4); nib[n++] = (uint8_t)(b & 0x0F); }}"
+            f" uint8_t sign = nib[--n];"
+            f" if (n > cap) {{ memmove(nib, nib + (n - cap), (size_t)cap); n = cap; }}"
+            f" int off = cap - n; uint8_t digits[600];"
+            f" for (int k = 0; k < cap; k++) digits[k] = (k >= off) ? nib[k - off] : 0;"
             f" for (int k = 0; k < nd; k++) M[(d0 + k) & MASK24] = (uint8_t)(0xF0u | digits[k]);"
-            f" M[(d0 + nd - 1) & MASK24] = (uint8_t)((sign << 4) | digits[nd - 1]); }}",
+            f" M[(d0 + nd - 1) & MASK24] = (uint8_t)((sign << 4) | digits[cap - 1]); }}",
             nxt,
         ]
 

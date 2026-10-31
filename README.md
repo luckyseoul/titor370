@@ -119,7 +119,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-260 passed
+262 passed
 ```
 
 Three kinds of test:
@@ -137,16 +137,26 @@ The example programs' expected results come from Python's own arithmetic
 (`sum([10,20,30,40,50])`, `math.factorial(10)`, `"HELLO WORLD".encode("cp037")`), not from the
 emulator, so they are independent checks rather than golden files.
 
-### A bug this test suite caught
+### Bugs this test suite caught
 
-The first version of `MVC` copied through a snapshot. Every non-overlapping test passed. The
-overlap test failed, and reading the PoP showed why: "the result is obtained as if each result
-byte were stored immediately after the necessary operand byte is fetched." Byte-at-a-time it
-is, then.
+These are worth listing, because they are the argument for building the thing rather than
+describing it:
 
-The same process caught `BCR` reading its mask from a register instead of its own field, and
-`BXLE` comparing against R0 instead of the implied comparand register — both of which made
-the subroutine example return to the wrong address.
+- **`MVC` copied through a snapshot.** Every non-overlapping test passed; the overlap test
+  failed. The PoP: "the result is obtained as if each result byte were stored immediately after
+  the necessary operand byte is fetched." Byte-at-a-time it is.
+- **`BCR` read its mask from a register** instead of its own `M1` field, so `BCR 15,14` did not
+  return from a subroutine.
+- **`BXLE` compared against R0** instead of the implied comparand register, so a table walk
+  looped the wrong number of times.
+- **The translated `CVD` used 16 digits** instead of 15, shifting every packed value one nibble.
+- **The translated `PACK`/`UNPK` left-aligned** where the PoP right-aligns, and `UNPK` reversed
+  the digit order.
+- **The interpreter's `UNPK` had a wrong length formula** (`2L+3` instead of `2L+1`), which the
+  translator — written independently — disagreed with.
+
+The last four were all found by one program, `examples/packed.s370`, which exists purely to
+make the interpreter and the translator disagree if either is wrong.
 
 ## Examples
 
@@ -156,6 +166,7 @@ the subroutine example return to the wrong address.
 | `factorial.s370` | 64-bit multiply and truncation, 10! = 3628800 |
 | `strings.s370` | MVC, TRT, TR with a 256-byte EBCDIC case table |
 | `search.s370` | BAL/BCR subroutine call and return, BXLE table walk |
+| `packed.s370` | CVD/CVB, PACK/UNPK, ICM/STCM, 64-bit shift, compare-and-swap |
 
 ## Limits, stated plainly
 
