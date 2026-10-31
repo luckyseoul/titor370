@@ -33,6 +33,10 @@ class AsmError(Exception):
 
 # Standard branch mnemonics, expanded to BC/BCR with an implicit mask.
 # Condition codes: 0 equal, 1 low, 2 high, 3 overflow. Mask bit 3-CC selects.
+SHIFT_MNEMONICS = {
+    "SLL", "SRL", "SLA", "SRA", "SLDL", "SRDL", "SLDA", "SRDA",
+}
+
 BRANCH_ALIASES: dict[str, int] = {
     "B": 15, "BR": 15,
     "BE": 8, "BNE": 7,
@@ -502,6 +506,11 @@ class Assembler:
 
         if fmt is Fmt.RS:
             r1 = self.reg(ops[0]) if ops else 0
+            if name in SHIFT_MNEMONICS:
+                # SLL R1,D2(B2): the second operand is the shift count, not a
+                # register. B2, if present, participates in forming the count.
+                d, _x, b = self.parse_dxbr(ops[1] if len(ops) > 1 else "0", current, False)
+                return encode(name, r1, 0, b, d)
             if name in ("ICM", "STCM", "CLM"):
                 # The second field is a 4-bit byte mask, not a register.
                 r3 = self.eval(ops[1], current) & 0xF if len(ops) > 1 else 0

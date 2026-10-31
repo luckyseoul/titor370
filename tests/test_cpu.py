@@ -254,6 +254,25 @@ def test_shift_amount_is_masked_to_six_bits():
     assert cpu.r[1] == 1
 
 
+def test_shift_amounts_of_32_or_more_shift_everything_out():
+    # GA22-7000-4: "Shift amounts from 31-63 cause the entire integer to be
+    # shifted out of the register. When the entire integer field of a positive
+    # number has been shifted out, the register contains zero. For a negative
+    # number, the register contains -1."
+    assert run_one("SLL", regs={1: 1}, fields=(1, 0, 0, 32)).r[1] == 0
+    assert run_one("SLL", regs={1: 0xFFFFFFFF}, fields=(1, 0, 0, 40)).r[1] == 0
+    assert run_one("SRL", regs={1: 0x80000000}, fields=(1, 0, 0, 32)).r[1] == 0
+    assert run_one("SRA", regs={1: 0x80000000}, fields=(1, 0, 0, 33)).r[1] == 0xFFFFFFFF
+    assert run_one("SRA", regs={1: 0x7FFFFFFF}, fields=(1, 0, 0, 32)).r[1] == 0
+
+
+def test_shift_amount_can_come_from_a_base_register():
+    # "A zero in the B2 field indicates the absence of indirect shift
+    # specification" -- with B2 set, the base register participates.
+    cpu = run_one("SLL", regs={3: 4, 1: 1}, fields=(1, 0, 3, 2))
+    assert cpu.r[1] == 1 << 6      # (R3 + 2) & 0x3F = 6
+
+
 def test_double_shift_moves_64_bits():
     # R2:R3 = 0x00000000_00000001 shifted left 1 -> R2=0, R3=2
     cpu = run_one("SLDL", regs={2: 0, 3: 1}, fields=(2, 0, 0, 1))
@@ -372,6 +391,24 @@ def test_cvd_and_cvb_roundtrip():
 def test_stm_and_lm_roundtrip():
     cpu = run_one("STM", regs={2: 0x11, 3: 0x22, 4: 0x33}, fields=(2, 4, 0, 0x200))
     assert cpu.read(0x200, 12) == (0x11).to_bytes(4, "big") + (0x22).to_bytes(4, "big") + (0x33).to_bytes(4, "big")
+
+
+def test_icm_condition_code_follows_the_leftmost_inserted_byte():
+    # Mask 0xC selects the two high-order bytes. The leftmost inserted byte is
+    # 0x01 (high bit clear) and the next is 0x80, so the code must be 2.
+    cpu = run_one("ICM", mem={0x200: b"\x01\x80"}, fields=(1, 0xC, 0, 0x200))
+    assert cpu.r[1] == 0x01800000
+    assert cpu.cc == 2
+
+    # Same bytes, but with the leftmost byte negative: code 1.
+    cpu = run_one("ICM", mem={0x200: b"\x81\x00"}, fields=(1, 0xC, 0, 0x200))
+    assert cpu.cc == 1
+
+
+def test_icm_zero_mask_is_not_an_error():
+    # "When the mask is zero ... the condition code is made 0."
+    cpu = run_one("ICM", mem={0x200: b"\xFF"}, fields=(1, 0, 0, 0x200))
+    assert cpu.cc == 0 and cpu.r[1] == 0
 
 
 def test_icm_inserts_selected_bytes():

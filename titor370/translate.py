@@ -294,6 +294,10 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
     x = ins.raw[1] & 0xF if ins.fmt is Fmt.RX else 0
     r1, r2, r3 = ins.r1, ins.r2, ins.r3
 
+    # Shift counts use the low six bits of the second-operand address, base
+    # register included (GA22-7000-4: "the second-operand address is not used
+    # to address data; its low-order six bits indicate the number of bits").
+    SH = f"({(f'(R[{b2}] + {d2}u)' if b2 else f'{d2}u')} & 0x3Fu)"
     A = f"ea({b2}u, {x}u, {d2}u)"       # RX second operand
     S = f"ea({b2}u, 0u, {d2}u)"         # S / SI / RS address
     D1 = f"ea({b1}u, 0u, {d1}u)"        # SS first operand
@@ -338,14 +342,19 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         "NI": f"{{ uint32_t v = ld8({S}) & 0x{ins.i2:02X}u; st8({S}, v); CC = (v == 0) ? 0 : 1; }}",
         "OI": f"{{ uint32_t v = ld8({S}) | 0x{ins.i2:02X}u; st8({S}, v); CC = (v == 0) ? 0 : 1; }}",
         "XI": f"{{ uint32_t v = ld8({S}) ^ 0x{ins.i2:02X}u; st8({S}, v); CC = (v == 0) ? 0 : 1; }}",
-        "SLL": f"R[{r1}] <<= {d2 & 0x3F}u;",
-        "SRL": f"R[{r1}] >>= {d2 & 0x3F}u;",
-        "SRA": f"R[{r1}] = (uint32_t)((int32_t)R[{r1}] >> {d2 & 0x3F}u); CC = cc_of((int32_t)R[{r1}]);",
+        "SLL": f"{{ unsigned n = (unsigned){SH}; R[{r1}] = (n >= 32u) ? 0u : (R[{r1}] << n); }}",
+        "SRL": f"{{ unsigned n = (unsigned){SH}; R[{r1}] = (n >= 32u) ? 0u : (R[{r1}] >> n); }}",
+        "SRA": (
+            f"{{ unsigned n = (unsigned){SH}; int32_t v = (int32_t)R[{r1}];"
+            f" if (n >= 32u) R[{r1}] = (v < 0) ? 0xFFFFFFFFu : 0u; else R[{r1}] = (uint32_t)(v >> n);"
+            f" CC = cc_of((int32_t)R[{r1}]); }}"
+        ),
         "SLA": (
-            f"{{ int32_t v0 = (int32_t)R[{r1}]; int sh = {d2 & 0x3F};"
-            f" int64_t s = (int64_t)v0 * (int64_t)(1ull << sh); R[{r1}] = (uint32_t)s;"
+            f"{{ unsigned n = (unsigned){SH}; int32_t v0 = (int32_t)R[{r1}];"
+            f" if (n >= 32u) {{ R[{r1}] = 0u; CC = 3; }}"
+            f" else {{ int64_t s = (int64_t)v0 * (int64_t)(1ull << n); R[{r1}] = (uint32_t)s;"
             f" CC = (s == 0) ? 0 : ((s < 0) ? 1 : 2);"
-            f" if (s > 2147483647LL || s < -2147483648LL) CC = 3; }}"
+            f" if (s > 2147483647LL || s < -2147483648LL) CC = 3; }} }}"
         ),
         "TS": f"{{ uint32_t v = ld8({S}); st8({S}, 0xFFu); CC = (v == 0) ? 0 : 1; }}",
         "LRA": f"R[{r1}] = {A};",
@@ -375,10 +384,12 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ),
         "STCM": f"{{ uint32_t a0 = {S}; for (int k = 0; k < 4; k++) if (({r3}u >> (3 - k)) & 1u) M[(a0 + k) & MASK24] = (uint8_t)(R[{r1}] >> (24 - 8 * k)); }}",
         "ICM": (
-            f"{{ uint32_t a0 = {S}; uint32_t v = 0; int first = 0;"
-            f" for (int k = 0; k < 4; k++) if (({r3}u >> (3 - k)) & 1u) {{ uint8_t b = M[(a0 + k) & MASK24];"
-            f" v |= (uint32_t)b << (24 - 8 * k); if (!first && (b & 0x80u)) first = 1; }}"
-            f" R[{r1}] = v; CC = (v == 0) ? 0 : (first ? 1 : 2); }}"
+            f"{{ uint32_t a0 = {S}; uint32_t v = 0; uint8_t firstb = 0; int have = 0;"
+            f" for (int k = 0; k < 4; k++) if (({r3}u >> (3 - k)) & 1u)"
+            f" {{ uint8_t b = M[(a0 + k) & MASK24]; if (!have) {{ firstb = b; have = 1; }}"
+            f" v |= (uint32_t)b << (24 - 8 * k); }}"
+            f" R[{r1}] = v;"
+            f" CC = (!have || v == 0) ? 0 : ((firstb & 0x80u) ? 1 : 2); }}"
         ),
         "CS": (
             f"{{ uint32_t a0 = {S}; uint32_t old = ld32(a0);"
@@ -433,6 +444,8 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name in ("MR", "M"):
+        if r1 % 2 or r1 == 15:
+            return [f'unimplemented(0x{ins.address:06X}u, "odd first operand");']
         src = f"(int32_t)R[{r2}]" if name == "MR" else f"(int32_t)ld32({A})"
         return [
             f"{{ int64_t p = (int64_t)(int32_t)R[{r1}] * (int64_t)({src});"
@@ -441,6 +454,8 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name in ("DR", "D"):
+        if r1 % 2 or r1 == 15:
+            return [f'unimplemented(0x{ins.address:06X}u, "odd first operand");']
         src = f"(int32_t)R[{r2}]" if name == "DR" else f"(int32_t)ld32({A})"
         return [
             f"{{ int32_t dvs = {src}; if (!dvs) unimplemented(0x{ins.address:06X}u, \"divide by zero\");"
@@ -543,12 +558,13 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name == "SLDL" or name == "SRDL":
-        shift = f"(x1 << {d2 & 0x3F})" if name == "SLDL" else f"(x1 >> {d2 & 0x3F})"
         if r1 % 2:
             return [f'unimplemented(0x{ins.address:06X}u, "odd double shift");']
+        op = "<<" if name == "SLDL" else ">>"
         return [
-            f"{{ uint64_t x1 = ((uint64_t)R[{r1}] << 32) | R[{r1 + 1}];"
-            f" uint64_t y = {shift}; R[{r1}] = (uint32_t)(y >> 32); R[{r1 + 1}] = (uint32_t)y; }}",
+            f"{{ unsigned n = (unsigned){SH}; uint64_t x = ((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}];"
+            f" if (n >= 64u) x = 0u; else x = x {op} n;"
+            f" R[{r1}] = (uint32_t)(x >> 32); R[{r1 + 1}] = (uint32_t)x; }}",
             nxt,
         ]
 
@@ -557,15 +573,20 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
             return [f'unimplemented(0x{ins.address:06X}u, "odd double shift");']
         if name == "SLDA":
             return [
-                f"{{ int64_t x1 = (int64_t)(((uint64_t)R[{r1}] << 32) | R[{r1 + 1}]);"
-                f" int64_t y = x1 << {d2 & 0x3F}; R[{r1}] = (uint32_t)(((uint64_t)y) >> 32); R[{r1 + 1}] = (uint32_t)y;"
+                f"{{ unsigned n = (unsigned){SH};"
+                f" int64_t x = (int64_t)(((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}]);"
+                f" int64_t y;"
+                f" if (n >= 64u) y = 0; else y = (int64_t)((uint64_t)x << n);"
+                f" R[{r1}] = (uint32_t)(((uint64_t)y) >> 32); R[{r1 + 1}] = (uint32_t)y;"
                 f" CC = (y == 0) ? 0 : ((y < 0) ? 1 : 2);"
-                f" if ((x1 >> (63 - {d2 & 0x3F})) != (x1 >> 63) && {d2 & 0x3F}) CC = 3; }}",
+                f" if (n && n < 64u && ((y >> n) != x)) CC = 3; }}",
                 nxt,
             ]
         return [
-            f"{{ int64_t x1 = (int64_t)(((uint64_t)R[{r1}] << 32) | R[{r1 + 1}]);"
-            f" int64_t y = x1 >> {d2 & 0x3F}; R[{r1}] = (uint32_t)(((uint64_t)y) >> 32); R[{r1 + 1}] = (uint32_t)y;"
+            f"{{ unsigned n = (unsigned){SH};"
+            f" int64_t x = (int64_t)(((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}]);"
+            f" int64_t y = (n >= 64u) ? (x < 0 ? -1 : 0) : (x >> n);"
+            f" R[{r1}] = (uint32_t)(((uint64_t)y) >> 32); R[{r1 + 1}] = (uint32_t)y;"
             f" CC = (y == 0) ? 0 : ((y < 0) ? 1 : 2); }}",
             nxt,
         ]

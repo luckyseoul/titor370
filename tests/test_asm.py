@@ -110,6 +110,24 @@ START    LR    1,2            ; trailing comment
     assert result["image"] == bytes.fromhex("181283000000")
 
 
+def test_shift_operand_is_a_count_not_a_register():
+    # SLL R1,D2(B2): the second operand is the shift amount.
+    result = assemble(
+        """
+        ORG   0x1000
+        SLL   1,32
+        SRL   2,7
+        SLA   3,1
+        END
+        """
+    )
+    assert result["image"] == (
+        bytes.fromhex("89100020")   # SLL 1,32
+        + bytes.fromhex("88200007")  # SRL 2,7
+        + bytes.fromhex("8B300001")  # SLA 3,1
+    )
+
+
 def test_undefined_symbol_is_an_error():
     with pytest.raises(AsmError):
         assemble(

@@ -119,7 +119,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-584 passed
+598 passed
 ```
 
 Three kinds of test:
@@ -158,6 +158,15 @@ describing it:
   the digit order.
 - **The interpreter's `UNPK` had a wrong length formula** (`2L+3` instead of `2L+1`), which the
   translator — written independently — disagreed with.
+- **The translator's 32-bit shifts were undefined behaviour** for counts ≥ 32: `R[i] <<= n` on a
+  `uint32_t` with `n` up to 63. gcc silently produced 0 where the machine produces all sign
+  bits. Now guarded explicitly.
+- **The assembler treated `SLL 1,32`'s `32` as a register number.** For shifts the second
+  operand is the shift count (a displacement), not a register — so no shift test had ever gone
+  through the assembler until this was found.
+- **`ICM`'s condition code used the first inserted byte with a high bit set**, rather than the
+  leftmost inserted byte, which is what the PoP specifies. Both the interpreter and the
+  translator had it wrong in the same way — mirroring a bug is still a bug.
 
 The last four were all found by one program, `examples/packed.s370`, which exists purely to
 make the interpreter and the translator disagree if either is wrong.
@@ -171,6 +180,8 @@ make the interpreter and the translator disagree if either is wrong.
 | `strings.s370` | MVC, TRT, TR with a 256-byte EBCDIC case table |
 | `search.s370` | BAL/BCR subroutine call and return, BXLE table walk |
 | `packed.s370` | CVD/CVB, PACK/UNPK, ICM/STCM, 64-bit shift, compare-and-swap |
+| `shifts.s370` | shift amounts of 32 and above, arithmetic vs logical |
+| `icm.s370` | ICM's condition code rule |
 
 ## Limits, stated plainly
 

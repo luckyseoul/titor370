@@ -920,23 +920,33 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_ICM(self, i: Instruction) -> None:
+        """Insert Characters Under Mask.
+
+        Condition code, per GA22-7000-4 p. 130: 0 when the mask is zero or all
+        inserted bytes are zero; otherwise 1 or 2 according to **the leftmost
+        bit of the storage operand** -- bit 0 of the first byte fetched, not
+        the first byte that happens to have a high bit set.
+        """
         addr = self._rs_addr(i)
         offsets = self._mask_bytes(i.r3)
         if not offsets:
-            raise SpecificationException("ICM zero mask", i.address)
+            # A zero mask inserts nothing: CC 0, no access, no exception.
+            self.r[i.r1] = 0
+            self.cc = 0
+            self.psw.ia = wrap24(i.address + i.length)
+            return
         value = 0
-        first_one = None
-        for k in range(4):
-            if k in offsets:
-                byte = self.fetch_byte(addr + k, i.address)
-                value |= byte << (24 - 8 * k)
-                if first_one is None and byte & 0x80:
-                    first_one = 1
+        first_byte = None
+        for k in offsets:
+            byte = self.fetch_byte(addr + k, i.address)
+            if first_byte is None:
+                first_byte = byte
+            value |= byte << (24 - 8 * k)
         self.r[i.r1] = value
         if value == 0:
             self.cc = 0
         else:
-            self.cc = 1 if first_one else 2
+            self.cc = 1 if (first_byte & 0x80) else 2
         self.psw.ia = wrap24(i.address + i.length)
 
     # ---------------- SI ----------------

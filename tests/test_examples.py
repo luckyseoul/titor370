@@ -77,3 +77,16 @@ def test_search_program_finds_the_value_with_a_subroutine():
     assert cpu.r[2] == expected
     assert cpu.fetch_u32(result["symbols"]["RESULT"]) == expected
     assert cpu.r[1] == table.index(needle) * 4
+
+
+def test_shifts_example():
+    cpu, result = run_example("shifts.s370")
+    # 1 << 32 shifts everything out; 1 >> 40 likewise; -8 >> 33 is all sign bits.
+    assert cpu.fetch_u32(result["symbols"]["OUT1"]) == 0
+    assert cpu.fetch_u32(result["symbols"]["OUT2"]) == 0
+    assert cpu.fetch_u32(result["symbols"]["OUT3"]) == 0xFFFFFFFF
+
+
+def test_icm_example_uses_the_leftmost_inserted_byte():
+    cpu, _ = run_example("icm.s370")
+    assert cpu.cc == 2

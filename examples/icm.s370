@@ -1,0 +1,11 @@
+*        ICM condition code must follow the LEFTMOST inserted byte, not the
+*        first inserted byte with a high bit set. Mask 1100 selects the two
+*        high-order bytes; the leftmost byte is 0x01 (high bit clear) and the
+*        second is 0x80 (high bit set). The correct code is 2, not 1.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         ICM   1,0xC,SRC
+         DIAG  0,0,0
+SRC      DC    X'0180'
+         END   START
