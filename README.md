@@ -139,6 +139,24 @@ It does **not** catch every kind of error — `TS` produced the wrong condition 
 different reason (zero-ness instead of the leftmost bit) and stayed inside its legal set {0,1}.
 A condition-code oracle bounds the damage; it does not replace reading the page.
 
+## A program-exception oracle
+
+`tests/test_exception_conformance.py` does the same thing for **exceptions**, from the
+"Characteristics" column of Appendix C: `MVCL` declares only `A SP`, so if a bug makes it raise
+a fixed-point divide, that is as wrong as a wrong answer and nothing else would notice.
+
+The negative direction is asserted strictly — an instruction may never raise an exception its
+row does not list. Reachability is reported and held to an aggregate floor rather than asserted
+per instruction, because some exceptions are genuinely unreachable here: a one-byte operand
+always lies inside a full 16 MiB store, so `TS` cannot take an access exception in this model.
+
+It found two real defects while being written:
+
+- **SS instructions did not bounds-check their operands.** An out-of-range field escaped as a
+  Python `IndexError` instead of an addressing exception.
+- **Fixed-point overflow never interrupted.** CC 3 was set, but the overflow was never raised
+  as a program exception even when the PSW's overflow mask bit was on. Both are now correct.
+
 ## An independent review
 
 `REVIEW.md` records a review of this project against Hercules, a mature System/370 emulator,
@@ -166,7 +184,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-709 passed
+889 passed
 ```
 
 Three kinds of test:

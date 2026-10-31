@@ -377,7 +377,12 @@ class CPU:
         if -2**31 <= result < 2**31:
             self.cc = cc_for(result)
             return u32(result)
-        self.cc = 3  # overflow takes precedence over sign (GA22-7000-4)
+        # Overflow takes precedence over the sign (GA22-7000-4), and causes a
+        # program interruption only when the fixed-point overflow mask bit --
+        # bit 3 of the program mask, i.e. 0x8 -- is one.
+        self.cc = 3
+        if self.psw.pmask & 0x8:
+            raise FixedPointOverflow("fixed-point overflow", where)
         return u32(result)
 
     def op_AR(self, i: Instruction) -> None:
@@ -1150,8 +1155,18 @@ class CPU:
     # ---------------- SS ----------------
 
     def _ss_addrs(self, i: Instruction) -> tuple[int, int]:
+        """SS operand addresses, checked against the end of store.
+
+        Every SS instruction accesses at least one byte at each operand, so the
+        check can be done here once rather than in each handler.
+        """
         a1 = self.addr(i.b1, i.d1, 0, i.address)
         a2 = self.addr(i.b2, i.d2, 0, i.address)
+        first_len = max(i.l1 + 1, i.l2 + 1)
+        self._check(a1, 1, i.address)
+        self._check(a2, 1, i.address)
+        # A field that runs past the end of store is an addressing exception.
+        self._check(a2, max(first_len, i.l1 + 1, i.l2 + 1), i.address)
         return a1, a2
 
     def op_MVC(self, i: Instruction) -> None:
