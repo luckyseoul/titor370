@@ -136,6 +136,14 @@ Three kinds of test:
   Python from their definitions across every edge-case pair (0, ±1, INT32_MIN/MAX, 0xFFFFFFFF,
   …), plus random 64-bit products and divisions. 320 checks that cannot agree with the
   emulator by accident.
+- **Differential fuzzing** (`tools/fuzz_diff.py`) — generates random straight-line programs,
+  runs them through both paths, and compares. 340 generated programs across five seeds agree;
+  roughly a quarter are skipped because they take a program check (divide by zero, odd
+  first operand), which the C path is documented not to model.
+
+```bash
+python3 tools/fuzz_diff.py --iterations 150 --seed 999
+```
 
 The example programs' expected results come from Python's own arithmetic
 (`sum([10,20,30,40,50])`, `math.factorial(10)`, `"HELLO WORLD".encode("cp037")`), not from the
