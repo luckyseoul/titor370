@@ -58,5 +58,10 @@ def test_translator_covers_everything_but_the_documented_exceptions():
 
 def test_readme_documents_the_untranslated_set():
     readme = (__import__("pathlib").Path(__file__).resolve().parent.parent / "README.md").read_text()
-    expected = "SVC, MVCL, CLCL, EX, CDS, LPSW, SSM"
-    assert expected in readme, f"README must list the untranslated instructions as {expected!r}"
+    # Derive the expectation from the table rather than hard-coding it, so the
+    # test cannot go stale the moment coverage changes.
+    for name in sorted(NOT_TRANSLATED):
+        assert name in readme, (
+            f"{name} is not translated but the README does not mention it; "
+            f"the untranslated set is {sorted(NOT_TRANSLATED)}"
+        )
