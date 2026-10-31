@@ -1,0 +1,21 @@
+*        Sum five fullwords and store the total.
+*        Classic base-register idiom: BALR establishes the base, USING tells
+*        the assembler how to turn labels into 12-bit displacements.
+         ORG   0x1000
+START    BALR  12,0             ; R12 = address of the next instruction
+         USING *,12             ; labels are now displacements off R12
+         LA    1,0              ; R1 = 0, the accumulator
+         LA    2,TABLE          ; R2 = table address
+         LA    3,5              ; R3 = count
+LOOP     A     1,0(2)           ; R1 += word at 0(R2)
+         LA    2,4(2)            ; R2 += 4
+         BCT   3,LOOP            ; repeat while R3 != 0
+         ST    1,RESULT
+         DIAG  0,0,0            ; halt convention
+TABLE    DC    F'10'
+         DC    F'20'
+         DC    F'30'
+         DC    F'40'
+         DC    F'50'
+RESULT   DS    F
+         END   START

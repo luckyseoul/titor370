@@ -1,0 +1,38 @@
+*        Search a word table for a value.
+*        BAL/BCR 15,14 for the subroutine call and return; BXLE to walk the
+*        table. BXLE compares against the register in R3 when R3 is odd, or
+*        R3+1 when R3 is even -- here R3 = 4, so R5 holds the limit.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         LA    3,TABLE          ; R3 = table base
+         L     0,NEEDLE         ; R0 = value to find
+         LA    1,0              ; R1 = byte offset into the table
+         LA    4,4              ; increment = one word
+         LA    5,LAST           ; limit = address of the final entry
+LOOP     BAL   14,FETCH        ; R6 = entry at TABLE + R1
+         CR    0,6
+         BE    FOUND
+         BXLE  1,4,LOOP         ; offset += 4; repeat while offset <= R5
+         L     2,NEGONE         ; not found
+         B     DONE
+FOUND    LR    2,6              ; R2 = the value found
+DONE     ST    2,RESULT
+         DIAG  0,0,0
+*        Subroutine: R6 = word at TABLE + R1.  Preserves R1.
+FETCH    ST    1,SAVE1
+         L     1,0(1,3)
+         LR    6,1
+         L     1,SAVE1          ; restore the offset
+         BCR   15,14
+NEEDLE   DC    F'70'
+NEGONE   DC    F'-1'
+SAVE1    DS    F
+RESULT   DS    F
+TABLE    DC    F'10'
+         DC    F'30'
+         DC    F'50'
+         DC    F'70'
+         DC    F'90'
+LAST     DC    F'90'
+         END   START

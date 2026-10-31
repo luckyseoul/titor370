@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "titor370"
+version = "0.1.0"
+description = "A verified System/370 interpreter and S/370-to-C translator: the machine the IBM 5100 was rumoured to be."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Emulators",
+]
+
+[project.scripts]
+titor370 = "titor370.cli:main"
+
+[tool.setuptools]
+packages = ["titor370"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

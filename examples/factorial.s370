@@ -1,0 +1,16 @@
+*        Factorial by repeated multiplication, using MR for a 64-bit product
+*        and DR to bring it back to one word.
+*        Result in R1 and at RESULT.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         LA    1,1              ; accumulator = 1
+         LA    2,10             ; counter = 10
+LOOP     LR    4,1              ; R4 = accumulator
+         MR    4,2              ; R4:R5 = R4 * R2 (signed 64-bit)
+         LR    1,5              ; low half back into R1
+         BCT   2,LOOP
+         ST    1,RESULT
+         DIAG  0,0,0
+RESULT   DS    F
+         END   START
