@@ -36,6 +36,10 @@ byte for byte. That is the whole idea.
 | `titor370/translate.py` | Static binary translator: S/370 → C |
 | `titor370/cli.py` | `asm`, `dis`, `run`, `translate`, `compare` |
 
+Where every opcode and rule came from: **[SOURCES.md](SOURCES.md)** — which edition of the
+Principles of Operation, which printed pages, and which rules were read off page images rather
+than OCR.
+
 ## Show me
 
 ```bash
