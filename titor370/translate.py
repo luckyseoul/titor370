@@ -766,6 +766,63 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
             nxt,
         ]
 
+    if name == "MVCL":
+        if r1 % 2 or r2 % 2:
+            return out + [f'unimplemented(0x{ins.address:06X}u, "MVCL odd register");']
+        check = "store_guard(daddr, dlen);" if guard else ""
+        return out + [
+            f"{{ uint32_t d = R[{r1}], s0 = R[{r2}];"
+            f" uint32_t daddr = d & MASK24, saddr = s0 & MASK24;"
+            f" uint32_t dlen = R[{r1 + 1}] & MASK24, slen = R[{r2 + 1}] & MASK24;"
+            f" uint8_t pad = (uint8_t)(R[{r2 + 1}] >> 24);"
+            f" uint32_t n = (dlen < slen) ? dlen : slen;"
+            f" {check}"
+            f" if (n && daddr > saddr && daddr < saddr + n) {{ CC = 3; }}"
+            f" else {{"
+            f"   for (uint32_t k = 0; k < n; k++) M[(daddr + k) & MASK24] = M[(saddr + k) & MASK24];"
+            f"   for (uint32_t k = slen; k < dlen; k++) M[(daddr + k) & MASK24] = pad;"
+            f"   CC = (dlen == slen) ? 0 : ((dlen < slen) ? 1 : 2);"
+            f"   R[{r1}] = (daddr + n) & MASK24; R[{r2}] = (saddr + n) & MASK24;"
+            f"   R[{r1 + 1}] = (R[{r1 + 1}] & 0xFF000000u) | ((dlen - n) & MASK24);"
+            f"   R[{r2 + 1}] = (R[{r2 + 1}] & 0xFF000000u) | ((slen - n) & MASK24);"
+            f" }} }}",
+            nxt,
+        ]
+
+    if name == "CLCL":
+        if r1 % 2 or r2 % 2:
+            return out + [f'unimplemented(0x{ins.address:06X}u, "CLCL odd register");']
+        return out + [
+            f"{{ uint32_t a0 = R[{r1}] & MASK24, b0 = R[{r2}] & MASK24;"
+            f" uint32_t alen = R[{r1 + 1}] & MASK24, blen = R[{r2 + 1}] & MASK24;"
+            f" uint8_t pad = (uint8_t)(R[{r2 + 1}] >> 24);"
+            f" uint32_t n = (alen < blen) ? alen : blen; CC = 0;"
+            f" for (uint32_t k = 0; k < n; k++) {{"
+            f"   uint8_t a = M[(a0 + k) & MASK24], c = M[(b0 + k) & MASK24];"
+            f"   if (a != c) {{ CC = (a < c) ? 1 : 2; break; }} }}"
+            f" if (CC == 0 && alen != blen) {{"
+            f"   uint32_t from = (alen < blen) ? b0 : a0;"
+            f"   uint32_t len = (alen < blen) ? blen : alen;"
+            f"   for (uint32_t k = n; k < len; k++) {{ uint8_t byte = M[(from + k) & MASK24];"
+            f"     if (byte != pad) {{ CC = (alen < blen) ? ((byte > pad) ? 1 : 2) : ((byte < pad) ? 1 : 2); break; }} }} }}"
+            f" R[{r1}] = (a0 + n) & MASK24; R[{r2}] = (b0 + n) & MASK24;"
+            f" R[{r1 + 1}] = (R[{r1 + 1}] & 0xFF000000u) | ((alen - n) & MASK24);"
+            f" R[{r2 + 1}] = (R[{r2 + 1}] & 0xFF000000u) | ((blen - n) & MASK24); }}",
+            nxt,
+        ]
+
+    if name == "CDS":
+        if r1 % 2:
+            return out + [f'unimplemented(0x{ins.address:06X}u, "CDS odd first operand");']
+        return out + [
+            f"{{ uint32_t a0 = {S}; if (a0 & 7u) unimplemented(0x{ins.address:06X}u, \"CDS operand not doubleword-aligned\");"
+            f" uint32_t old1 = ld32(a0), old2 = ld32(a0 + 4u);"
+            f" if (old1 == R[{r1}] && old2 == R[{r1 + 1}]) {{"
+            f"   st32(a0, R[{r3}]); st32(a0 + 4u, R[{r3 + 1}]); CC = 0;"
+            f" }} else {{ R[{r1}] = old1; R[{r1 + 1}] = old2; CC = 1; }} }}",
+            nxt,
+        ]
+
     if name == "DIAG":
         return out + ["goto done;"]
 
@@ -773,7 +830,7 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
         return out + [f'unimplemented(0x{ins.address:06X}u, "SVC is not translated");']
 
     # Instructions the interpreter implements but the translator does not.
-    if name in ("EX", "MVCL", "CLCL", "CDS", "SSM", "LPSW", "LRA",
+    if name in ("EX", "SSM", "LPSW", "LRA",
                 "AP", "SP", "MP", "DP", "ZAP", "CP"):
         return out + [f'unimplemented(0x{ins.address:06X}u, "{name} is not translated");']
 

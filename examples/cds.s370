@@ -1,0 +1,19 @@
+*        COMPARE DOUBLE AND SWAP: equal case swaps, unequal case loads.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         LA    4,TARGET
+         L     2,T1
+         L     3,T2
+         L     6,NEW1
+         L     7,NEW2
+         CDS   2,6,TARGET      ; equal -> store R6:R7
+         DIAG  0,0,0
+T1       DC    F'11'
+T2       DC    F'22'
+NEW1     DC    F'33'
+NEW2     DC    F'44'
+         DS    0D
+TARGET   DC    F'11'
+         DC    F'22'
+         END   START

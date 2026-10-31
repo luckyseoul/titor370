@@ -1,0 +1,20 @@
+*        MOVE LONG and COMPARE LOGICAL LONG: copy with padding, then compare.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         LA    2,DEST
+         LA    3,6             ; destination length
+         LA    4,SRC
+         LA    5,3             ; source length, pad byte 0x00
+         MVCL  2,4
+         LA    2,DEST
+         LA    3,6
+         LA    4,OTHER
+         LA    5,6
+         CLCL  2,4
+         DIAG  0,0,0
+SRC      DC    C'ABC'
+OTHER    DC    C'ABC'
+         DC    X'000000'
+DEST     DS    6C
+         END   START

@@ -205,7 +205,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-948 passed, 1 skipped
+950 passed, 1 skipped
 ```
 
 Three kinds of test:
@@ -277,6 +277,9 @@ make the interpreter and the translator disagree if either is wrong.
 | `strings.s370` | MVC, TRT, TR with a 256-byte EBCDIC case table |
 | `search.s370` | BAL/BCR subroutine call and return, BXLE table walk |
 | `packed.s370` | CVD/CVB, PACK/UNPK, ICM/STCM, 64-bit shift, compare-and-swap |
+| `decimal.s370` | packed-decimal arithmetic (runs; the translator does not emit it) |
+| `mvcl.s370` | MOVE LONG with padding, COMPARE LOGICAL LONG |
+| `cds.s370` | COMPARE DOUBLE AND SWAP |
 | `shifts.s370` | shift amounts of 32 and above, arithmetic vs logical |
 | `icm.s370` | ICM's condition code rule |
 
@@ -293,7 +296,8 @@ make the interpreter and the translator disagree if either is wrong.
   `BALR r,0` are propagated so ordinary `USING`-style code resolves correctly.
 - **No decimal arithmetic.** `AP`/`SP`/`MP`/`DP`/`ZAP` and friends are unimplemented; `PACK`,
   `UNPK`, `CVD` and `CVB` are implemented and tested.
-- **Not translated:** SVC, MVCL, CLCL, EX, CDS, LPSW, SSM, LRA. The interpreter runs these (or
+- **Not translated:** SVC, EX, LPSW, SSM, LRA, and the decimal arithmetic of the previous
+  section. The interpreter runs these (or
   raises for the privileged ones); the C translator does not emit code for them, and
   `tests/test_coverage.py` fails if this list and the code disagree.
 - **Self-modifying programs are not translated.** The generated C checks every store against
