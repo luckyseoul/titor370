@@ -67,6 +67,8 @@ CC_SETS: dict[str, frozenset[int]] = {
     # Decimal arithmetic (Appendix E, Decimal Instructions)
     "AP": frozenset({0, 1, 2, 3}), "SP": frozenset({0, 1, 2, 3}),
     "ZAP": frozenset({0, 1, 2, 3}), "CP": frozenset({0, 1, 2}),
+    "SRP": frozenset({0, 1, 2, 3}),
+    "ED": frozenset({0, 1, 2}), "EDMK": frozenset({0, 1, 2}),
     "TM": frozenset({0, 1, 3}),
     "TRT": frozenset({0, 1, 2}),
 }
@@ -81,7 +83,7 @@ CC_UNCHANGED: frozenset[str] = frozenset(
     MR M D DR MH
     SLL SRL SLDL SRDL
     MVI
-    MP DP
+    MP DP MVO
     """.split()
 )
 
@@ -185,6 +187,31 @@ def _sweep_ss(name: str) -> set[int]:
         if cc is not None:
             seen.add(cc)
     # Packed decimal requires valid sign nibbles; sweep values, not random bytes.
+    if name == "SRP":
+        for value in (bytes.fromhex("01234C"), bytes.fromhex("99999C"),
+                      bytes.fromhex("00000C"), bytes.fromhex("09999D")):
+            for shift in (0x02, 0x3E, 0x00):
+                cpu = _base()
+                cpu.write(0x200, value)
+                cc = _run(cpu, name, (len(value) - 1, 0, 0, 0x200, 0, shift))
+                if cc is not None:
+                    seen.add(cc)
+        return seen
+    if name in ("ED", "EDMK"):
+        # A pattern of fill + selectors, and sources with and without leading
+        # zeros, reach all three condition codes.
+        # Even-length fields only. Two selectors consume two digits: all-zero
+        # gives CC 0, a plus sign leaves the indicator off (CC 2), and a minus
+        # sign leaves it on (CC 1).
+        for field in (bytes.fromhex("009C"), bytes.fromhex("009D"),
+                      bytes.fromhex("000C"), bytes.fromhex("000D")):
+            cpu = _base()
+            cpu.write(0x200, bytes([0x40, 0x20, 0x20, 0x20]))
+            cpu.write(0x300, field)
+            cc = _run(cpu, name, (3, len(field) - 1, 0, 0x200, 0, 0x300))
+            if cc is not None:
+                seen.add(cc)
+        return seen
     if name in ("AP", "SP", "ZAP", "CP", "MP", "DP"):
         for left in (0, 1, -1, 1234, -1234, 999, -999, 9999999, -9999999):
             for right in (0, 1, -1, 7, -7, 100, 9999999):

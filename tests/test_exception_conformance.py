@@ -74,6 +74,7 @@ EXCEPTIONS = {
     "CLC": {A}, "TR": {A}, "TRT": {A},
     "AP": {A, D, DF}, "SP": {A, D, DF}, "ZAP": {A, D, DF},
     "MP": {A, SP, D}, "DP": {A, SP, D, DK}, "CP": {A, D},
+    "MVO": {A}, "SRP": {A, D, DF}, "ED": {A, D}, "EDMK": {A, D},
     "PACK": {A, SP}, "UNPK": {A},
     "MVI": {A}, "NI": {A}, "OI": {A}, "XI": {A},
     "TM": {A}, "CLI": {A},

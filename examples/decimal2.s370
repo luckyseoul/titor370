@@ -1,0 +1,27 @@
+*        A wider decimal sweep: add, subtract, multiply, divide, compare,
+*        move-with-offset and shift-and-round, so the interpreter and the
+*        translated C are compared over all of them.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         ZAP   A(6),N1(4)        ; A = -1234
+         AP    A(6),N2(2)        ; A += 99
+         SP    A(6),N3(2)        ; A -= -7
+         CP    A(6),N4(4)        ; compare with 500
+         MP    B(6),N5(1)        ; B = 4321 * 9
+         DP    C(6),N6(1)        ; 9999 / 7
+         SRP   A(6),0x3E,5       ; shift A right two with rounding 5
+         MVO   D(4),N7(2)        ; offset move
+         DIAG  0,0,0
+A        DC    X'00000000000C'
+B        DC    X'00000004321C'
+C        DC    X'00000009999C'
+D        DC    X'0000000C'
+N1       DC    X'0001234D'
+N2       DC    X'099C'
+N3       DC    X'007D'
+N4       DC    X'0000500C'
+N5       DC    X'9C'
+N6       DC    X'7C'
+N7       DC    X'345C'
+         END   START

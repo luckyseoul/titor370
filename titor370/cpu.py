@@ -191,7 +191,7 @@ class PSW:
 
 IMPLEMENTED = """
 AR SR ALR SLR LR LTR LNR LPR LCR NR OR XR CR CLR MR DR
-AP SP MP DP ZAP CP
+AP SP MP DP ZAP CP MVO SRP ED EDMK
 BALR BCTR BCR SVC MVCL CLCL
 L ST LA LH STH IC STC A S AL SL N O X C CL M D AH SH CH MH CVD CVB
 EX BAL BCT BC LRA
@@ -204,7 +204,6 @@ DIAG
 
 UNIMPLEMENTED = """
 SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH
-ED EDMK SRP MVO
 LRER LRDR LTER LTDR LCER LCDR
 AD ADR AE AER AW AWR AU AUR SD SDR SE SER SW SWR SU SUR
 MD MDR ME MER MXD MXDR MXR DD DDR DE DER
@@ -1271,7 +1270,9 @@ class CPU:
             quotient, remainder = _trunc_divmod(dividend, divisor)
             quotient_bytes = l1 - l2
             if abs(quotient) >= 10 ** (2 * quotient_bytes - 1):
-                raise ProgramCheck(0x0B, "decimal divide quotient overflow", i.address)
+                # Decimal divide: program mask bit 2.
+                if self.psw.pmask & 0x2:
+                    raise ProgramCheck(0x0B, "decimal divide quotient overflow", i.address)
             self._decimal_out(a1, quotient_bytes, quotient)
             self._decimal_out(a1 + quotient_bytes, l2, remainder)
             self.psw.ia = wrap24(i.address + i.length)
@@ -1307,6 +1308,202 @@ class CPU:
 
     def op_DP(self, i: Instruction) -> None:
         self._decimal_op(i, "DP")
+
+    # ---------------- remaining decimal instructions ----------------
+
+    def _nibbles(self, addr: int, length: int) -> list[int]:
+        out: list[int] = []
+        for byte in self.read(addr, length):
+            out.append(byte >> 4)
+            out.append(byte & 0x0F)
+        return out
+
+    def _write_nibbles(self, addr: int, length: int, nibbles: list[int]) -> None:
+        capacity = 2 * length
+        if len(nibbles) > capacity:
+            nibbles = nibbles[-capacity:]
+        else:
+            nibbles = [0] * (capacity - len(nibbles)) + nibbles
+        out = bytearray(length)
+        for index in range(length):
+            out[index] = (nibbles[2 * index] << 4) | nibbles[2 * index + 1]
+        self.write(addr, bytes(out))
+
+    def op_MVO(self, i: Instruction) -> None:
+        """MOVE WITH OFFSET.
+
+        "The low-order four bits of the first operand are attached as low-order
+        bits to the second operand, the second operand bits are offset by four
+        bit positions, and the result is placed in the first-operand location"
+        (GA22-7000-4, p. 135). No code checking is done.
+        """
+        a1, a2 = self._ss_addrs(i)
+        l1, l2 = i.l1 + 1, i.l2 + 1
+        low = self.memory[a1 + l1 - 1] & 0x0F
+        combined = self._nibbles(a2, l2) + [low]
+        self._write_nibbles(a1, l1, combined)
+        self.psw.ia = wrap24(i.address + i.length)
+
+    def op_SRP(self, i: Instruction) -> None:
+        """SHIFT AND ROUND DECIMAL.
+
+        The shift value is the low six bits of the second-operand address, as a
+        signed number: positive shifts left, negative right (p. 153-154). For a
+        right shift the rounding factor I3 -- the second nibble of the length
+        byte -- is added to the digits shifted out, and the carry propagated.
+        """
+        a1, _a2 = self._ss_addrs(i)
+        length = i.l1 + 1
+        shift = self.addr(i.b2, i.d2) & 0x3F
+        if shift & 0x20:
+            shift -= 0x40
+        rounding = i.l2              # I3 lives in the low half of the length byte
+
+        digits = self._nibbles(a1, length)
+        sign = digits.pop()
+        if sign not in self.PLUS_SIGNS and sign not in self.MINUS_SIGNS:
+            raise ProgramCheck(0x07, "invalid packed sign in SRP", i.address)
+        if any(d > 9 for d in digits):
+            raise ProgramCheck(0x07, "invalid packed digit in SRP", i.address)
+        if rounding > 9:
+            raise ProgramCheck(0x07, "invalid SRP rounding factor", i.address)
+
+        capacity = len(digits)
+        value = int("".join(str(d) for d in digits)) if digits else 0
+        negative = sign in self.MINUS_SIGNS
+        overflow = False
+
+        if shift >= 0:
+            # Left shift: digits move into the high-order positions.
+            limit = 10 ** capacity
+            scaled = value * (10 ** shift)
+            if scaled >= limit:
+                overflow = True
+                scaled %= limit
+            value = scaled
+        else:
+            right = -shift
+            # Round by adding the rounding factor to the leftmost digit that
+            # will be shifted out, propagating the carry.
+            if right <= capacity:
+                cut = 10 ** right
+                low = value % cut
+                high = value // cut
+                if rounding and low >= cut // 10 * (10 - rounding):
+                    pass
+                # Add the rounding factor to the digit position being dropped.
+                add = rounding * (10 ** (right - 1))
+                total = low + add
+                high += total // cut
+                value = high
+                if high >= 10 ** capacity:
+                    overflow = True
+                    value = high % (10 ** capacity)
+            else:
+                value = 0
+
+        self._decimal_out(a1, length, -value if negative else value)
+        if value == 0:
+            self.cc = 0
+        else:
+            self.cc = 1 if negative else 2
+        self.psw.ia = wrap24(i.address + i.length)
+        # "Decimal overflow occurs ... during left shift" (p. 154).
+        if overflow and shift > 0:
+            self.cc = 3
+            self._decimal_overflow("SRP overflow", i.address)
+
+    def _edit(self, i: Instruction, mark: bool) -> None:
+        """EDIT / EDIT AND MARK.
+
+        The pattern (first operand) is zoned text; the source (second operand)
+        is packed decimal. Sixteen pattern bytes are examined, each replaced by
+        the fill character, a zoned source digit, or left as message text,
+        depending on the significance indicator (GA22-7000-4, pp. 150-152).
+        """
+        pattern, source = self._ss_addrs(i)
+        length = i.l1 + 1
+        pattern_bytes = list(self.read(pattern, length))
+        if not pattern_bytes:
+            return
+
+        DIGIT_SELECTOR, SIGNIFICANCE_STARTER, FIELD_SEPARATOR = 0x20, 0x21, 0x22
+        fill = pattern_bytes[0]
+
+        # Unpack the source into (digit, plus_sign) pairs.
+        source_nibbles: list[tuple[int, bool]] = []
+        for byte in self.read(source, i.l2 + 1):
+            hi, lo = byte >> 4, byte & 0x0F
+            if hi > 9:
+                raise ProgramCheck(0x07, "invalid packed digit in EDIT source", i.address)
+            if lo in self.PLUS_SIGNS:
+                source_nibbles.append((hi, True))
+            elif lo in self.MINUS_SIGNS:
+                source_nibbles.append((hi, False))
+            else:
+                if lo > 9:
+                    raise ProgramCheck(0x07, "invalid packed digit in EDIT source", i.address)
+                source_nibbles.append((hi, False))
+                source_nibbles.append((lo, False))
+
+        cursor = 0
+        indicator = False
+        field_nonzero = False
+        result = bytearray(length)
+
+        for index, char in enumerate(pattern_bytes):
+            if char == DIGIT_SELECTOR or char == SIGNIFICANCE_STARTER:
+                was_off = not indicator
+                if cursor >= len(source_nibbles):
+                    digit, plus = 0, False
+                else:
+                    digit, plus = source_nibbles[cursor]
+                    cursor += 1
+                if digit:
+                    field_nonzero = True
+
+                # Summary table, p. 152.
+                if char == DIGIT_SELECTOR:
+                    if not indicator and digit == 0:
+                        result[index] = fill
+                    elif not indicator and digit:
+                        result[index] = 0xF0 | digit
+                        indicator = not plus
+                    else:
+                        result[index] = 0xF0 | digit
+                        indicator = not plus
+                else:  # significance starter
+                    if digit == 0:
+                        result[index] = fill
+                    else:
+                        result[index] = 0xF0 | digit
+                        indicator = not plus
+                if mark and was_off and (0xF0 | digit) == result[index] and digit:
+                    # "whenever the result character is a zoned source digit
+                    # and the significance indicator was off before the
+                    # examination" (p. 153)
+                    self.r[1] = (self.r[1] & 0xFF000000) | (pattern + index)
+            elif char == FIELD_SEPARATOR:
+                result[index] = fill
+                indicator = False
+                field_nonzero = False
+            else:
+                result[index] = char if indicator else fill
+
+        # "The filler character replaces the pattern character" only where the
+        # indicator is off; message characters survive while it is on.
+        self.write(pattern, bytes(result))
+        if not field_nonzero:
+            self.cc = 0
+        else:
+            self.cc = 1 if indicator else 2
+        self.psw.ia = wrap24(i.address + i.length)
+
+    def op_ED(self, i: Instruction) -> None:
+        self._edit(i, mark=False)
+
+    def op_EDMK(self, i: Instruction) -> None:
+        self._edit(i, mark=True)
 
     def op_MVC(self, i: Instruction) -> None:
         dest, src = self._ss_addrs(i)
@@ -1463,11 +1660,6 @@ class CPU:
         # not implement the decimal feature, so executing one is an operation
         # exception, not a privileged-operation exception.
         raise OperationException(f"{i.name} (decimal feature not implemented)", i.address)
-
-    op_ED = _privileged_ss
-    op_EDMK = _privileged_ss
-    op_SRP = _privileged_ss
-    op_MVO = _privileged_ss
 
     # ---------------- helpers used by tests and the CLI ----------------
 

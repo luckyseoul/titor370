@@ -153,7 +153,7 @@ TWO_BYTE_OPS: dict[str, tuple[int, int, Fmt]] = {
 # L2 (decimal and pack/unpack operations). All other SS instructions carry a
 # single 8-bit length applying to both operands.
 SS_TWO_LENGTHS = {
-    "MVO", "PACK", "UNPK", "ZAP", "CP", "AP", "SP", "MP", "DP",
+    "MVO", "PACK", "UNPK", "ZAP", "CP", "AP", "SP", "MP", "DP", "SRP",
 }
 
 MNEMONIC_BY_CODE: dict[int, str] = {}

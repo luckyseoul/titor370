@@ -94,6 +94,41 @@ static void unimplemented(uint32_t at, const char *what)
 
 /* Static translation cannot follow a store into the code it was generated
  * from: the interpreter would decode the new bytes, this program cannot. */
+/* ---- packed decimal helpers, mirroring the interpreter ---- */
+static uint32_t PMASK;   /* program mask, mirrored from the initial PSW */
+
+static int64_t dec_in(uint32_t addr, unsigned len, unsigned at)
+{
+    int64_t v = 0; unsigned sign = 0;
+    for (unsigned i = 0; i < len; i++) {
+        uint8_t b = M[(addr + i) & MASK24];
+        unsigned hi = b >> 4, lo = b & 0x0F;
+        if (hi > 9) unimplemented(at, "invalid packed digit");
+        if (i + 1 == len) { sign = lo; v = v * 10 + hi; }
+        else { if (lo > 9) unimplemented(at, "invalid packed digit"); v = v * 100 + hi * 10 + lo; }
+    }
+    if (sign != 0xA && sign != 0xC && sign != 0xE && sign != 0xF &&
+        sign != 0xB && sign != 0xD)
+        unimplemented(at, "invalid packed sign");
+    return (sign == 0xB || sign == 0xD) ? -v : v;
+}
+
+static void dec_out(uint32_t addr, unsigned len, int64_t value, unsigned at)
+{
+    unsigned cap = 2 * len - 1;
+    uint64_t mag = value < 0 ? (uint64_t)(-value) : (uint64_t)value;
+    uint8_t dg[64];
+    for (int k = (int)cap - 1; k >= 0; k--) { dg[k] = (uint8_t)(mag % 10); mag /= 10; }
+    if (mag) unimplemented(at, "decimal overflow beyond the field");
+    for (unsigned k = 0; k < len; k++) {
+        uint8_t hi = (2 * k < cap) ? dg[2 * k] : 0;
+        uint8_t lo = (2 * k + 1 < cap) ? dg[2 * k + 1] : (uint8_t)(value < 0 ? 0xD : 0xC);
+        M[(addr + k) & MASK24] = (uint8_t)((hi << 4) | lo);
+    }
+    M[(addr + len - 1) & MASK24] =
+        (uint8_t)((M[(addr + len - 1) & MASK24] & 0xF0u) | (value < 0 ? 0xD : 0xC));
+}
+
 static void store_guard(uint32_t addr, unsigned len)
 {
     uint32_t lo = addr & MASK24, hi = lo + len;
@@ -324,6 +359,7 @@ def translate(
         "    memcpy(M + PROGRAM_BASE, program_image, sizeof program_image);\n"
         "    for (int i = 0; i < 16; i++) R[i] = initial_regs[i];\n"
         "    CC = 0;\n"
+        "    PMASK = 0;\n"
         "    IA = PROGRAM_BASE;\n"
         "    s370_run();\n"
         '    printf("R");\n'
@@ -823,6 +859,97 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
             nxt,
         ]
 
+    if name in ("AP", "SP", "ZAP", "CP", "MP", "DP"):
+        a1, a2 = D1, D2
+        l1, l2 = L1 + 1, L2 + 1
+        cap = 2 * l1 - 1
+        if name == "CP":
+            return out + [
+                f"{{ int64_t x = dec_in({a1}, {l1}u, 0x{ins.address:06X}u);"
+                f" int64_t y = dec_in({a2}, {l2}u, 0x{ins.address:06X}u);"
+                f" CC = (x == y) ? 0 : ((x < y) ? 1 : 2); }}",
+                nxt,
+            ]
+        if name == "ZAP":
+            return out + [
+                f"{{ int64_t v = dec_in({a2}, {l2}u, 0x{ins.address:06X}u);"
+                f" int ovf = (v <= -1000000000000000000LL) || (v >= 1000000000000000000LL);"
+                f" dec_out({a1}, {l1}u, v, 0x{ins.address:06X}u);"
+                f" int64_t s = dec_in({a1}, {l1}u, 0x{ins.address:06X}u);"
+                f" if (ovf) {{ CC = 3; if (PMASK & 0x8u) unimplemented(0x{ins.address:06X}u, \"decimal overflow\"); }}"
+                f" else CC = (s == 0) ? 0 : ((s < 0) ? 1 : 2); }}",
+                nxt,
+            ]
+        if name in ("MP", "DP"):
+            check = (f"if ({l2}u >= {l1}u) unimplemented(0x{ins.address:06X}u, \"{name} second operand too long\");"
+                     if False else "")
+            if name == "MP":
+                return out + [
+                    f"{{ if ({l2}u >= {l1}u) unimplemented(0x{ins.address:06X}u, \"MP second operand too long\");"
+                    f" int64_t x = dec_in({a1}, {l1}u, 0x{ins.address:06X}u);"
+                    f" int64_t y = dec_in({a2}, {l2}u, 0x{ins.address:06X}u);"
+                    f" dec_out({a1}, {l1}u, x * y, 0x{ins.address:06X}u); }}",
+                    nxt,
+                ]
+            return out + [
+                f"{{ if ({l2}u >= {l1}u) unimplemented(0x{ins.address:06X}u, \"DP second operand too long\");"
+                f" int64_t dvd = dec_in({a1}, {l1}u, 0x{ins.address:06X}u);"
+                f" int64_t dvs = dec_in({a2}, {l2}u, 0x{ins.address:06X}u);"
+                f" if (!dvs) unimplemented(0x{ins.address:06X}u, \"decimal divide by zero\");"
+                f" int64_t q = dvd / dvs, rem = dvd % dvs;"
+                f" dec_out({a1}, {l1 - l2}u, q, 0x{ins.address:06X}u);"
+                f" dec_out({a1} + {l1 - l2}u, {l2}u, rem, 0x{ins.address:06X}u); }}",
+                nxt,
+            ]
+        op = {"AP": "+", "SP": "-"}[name]
+        return out + [
+            f"{{ int64_t x = dec_in({a1}, {l1}u, 0x{ins.address:06X}u);"
+            f" int64_t y = dec_in({a2}, {l2}u, 0x{ins.address:06X}u);"
+            f" int64_t v = x {op} y;"
+            f" dec_out({a1}, {l1}u, v, 0x{ins.address:06X}u);"
+            f" int64_t s = dec_in({a1}, {l1}u, 0x{ins.address:06X}u);"
+            f" CC = (s == 0) ? 0 : ((s < 0) ? 1 : 2); }}",
+            nxt,
+        ]
+
+    if name == "MVO":
+        return out + [
+            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int l1 = {L1 + 1}, l2 = {L2 + 1};"
+            f" uint8_t low = M[(d0 + l1 - 1) & MASK24] & 0x0Fu;"
+            f" uint8_t nb[64]; int n = 0;"
+            f" for (int k = 0; k < l2; k++) {{ uint8_t b = M[(s0 + k) & MASK24];"
+            f"   nb[n++] = (uint8_t)(b >> 4); nb[n++] = (uint8_t)(b & 0x0F); }}"
+            f" nb[n++] = low;"
+            f" int cap = 2 * l1; if (n > cap) {{ memmove(nb, nb + (n - cap), (size_t)cap); n = cap; }}"
+            f" for (int k = 0; k < l1; k++) M[(d0 + k) & MASK24] = 0;"
+            f" for (int k = 0; k < n; k++) {{ int pos = cap - n + k;"
+            f"   M[(d0 + pos / 2) & MASK24] = (uint8_t)((M[(d0 + pos / 2) & MASK24] &"
+            f"     (pos % 2 ? 0xF0u : 0x0Fu)) | (uint8_t)(nb[k] << (pos % 2 ? 0 : 4))); }} }}",
+            nxt,
+        ]
+
+    if name == "SRP":
+        return out + [
+            f"{{ uint32_t d0 = {D1}; int len = {L1 + 1}; int shift = (int)(ea({b2}u, 0u, {d2}u) & 0x3Fu);"
+            f" if (shift & 0x20) shift -= 0x40; int rounding = {L2};"
+            f" int64_t v = dec_in(d0, (unsigned)len, 0x{ins.address:06X}u);"
+            f" int cap = 2 * len - 1; int64_t limit = 1; for (int k = 0; k < cap; k++) limit *= 10;"
+            f" int ovf = 0;"
+            f" if (shift >= 0) {{ int64_t s = v; for (int k = 0; k < shift; k++) s *= 10;"
+            f"   if (s >= limit || s <= -limit) {{ ovf = 1; s %= limit; }} v = s;"
+            f" }} else {{ int right = -shift;"
+            f"   if (right <= cap) {{ int64_t cut = 1; for (int k = 0; k < right; k++) cut *= 10;"
+            f"     int64_t low = v % cut, high = v / cut;"
+            f"     int64_t add = (int64_t)rounding; for (int k = 1; k < right; k++) add *= 10;"
+            f"     high += (low + add) / cut;"
+            f"     if (high >= limit || high <= -limit) {{ ovf = 1; high %= limit; }}"
+            f"     v = high; }} else v = 0; }}"
+            f" dec_out(d0, (unsigned)len, v, 0x{ins.address:06X}u);"
+            f" CC = (v == 0) ? 0 : ((v < 0) ? 1 : 2);"
+            f" if (ovf && shift > 0) {{ CC = 3; if (PMASK & 0x8u) unimplemented(0x{ins.address:06X}u, \"SRP overflow\"); }} }}",
+            nxt,
+        ]
+
     if name == "DIAG":
         return out + ["goto done;"]
 
@@ -830,8 +957,7 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
         return out + [f'unimplemented(0x{ins.address:06X}u, "SVC is not translated");']
 
     # Instructions the interpreter implements but the translator does not.
-    if name in ("EX", "SSM", "LPSW", "LRA",
-                "AP", "SP", "MP", "DP", "ZAP", "CP"):
+    if name in ("EX", "SSM", "LPSW", "LRA", "ED", "EDMK"):
         return out + [f'unimplemented(0x{ins.address:06X}u, "{name} is not translated");']
 
     return out + [f'unimplemented(0x{ins.address:06X}u, "{name}");']

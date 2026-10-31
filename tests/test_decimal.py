@@ -174,3 +174,104 @@ def test_multiplier_must_be_shorter_than_the_multiplicand():
 def test_divisor_must_be_shorter_than_the_dividend():
     with pytest.raises(SpecificationException):
         run("DP", pack(2, 2), pack(3, 2))
+
+
+# ---------------------------------------------------------------------------
+# MOVE WITH OFFSET, SHIFT AND ROUND, EDIT, EDIT AND MARK
+# ---------------------------------------------------------------------------
+
+
+def test_move_with_offset_shifts_by_four_bits():
+    # "The low-order four bits of the first operand are attached as low-order
+    # bits to the second operand" (p. 135).
+    cpu = CPU()
+    cpu.write(0x200, bytes.fromhex("00000C"))
+    cpu.write(0x300, bytes.fromhex("345C"))
+    cpu.load(BASE, encode("MVO", 2, 1, 0, 0x200, 0, 0x300))
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.read(0x200, 3) == bytes.fromhex("0345CC")
+
+
+def _srp(field: bytes, shift: int, rounding: int):
+    cpu = CPU()
+    cpu.write(0x200, field)
+    cpu.load(BASE, encode("SRP", len(field) - 1, rounding, 0, 0x200, 0, shift & 0x3F))
+    cpu.psw.ia = BASE
+    cpu.step()
+    return cpu
+
+
+@pytest.mark.parametrize("field,shift,rounding,expected", [
+    (bytes.fromhex("01234C"), -2, 0, 12),     # right shift, no rounding
+    (bytes.fromhex("01234C"), -2, 5, 12),     # 34 + 50 = 84: no carry
+    (bytes.fromhex("01299C"), -2, 5, 13),     # 99 + 50 = 149: carry
+    (bytes.fromhex("0001234C"), 1, 0, 12340),  # left shift
+    (bytes.fromhex("01234C"), 0, 0, 1234),     # no shift
+])
+def test_shift_and_round_decimal(field, shift, rounding, expected):
+    cpu = _srp(field, shift, rounding)
+    assert unpack(cpu.read(0x200, len(field))) == expected
+
+
+def test_shift_left_overflow_sets_cc3_and_truncates():
+    cpu = _srp(bytes.fromhex("01234C"), 2, 0)   # 123400 in a five-digit field
+    assert cpu.cc == 3
+    assert unpack(cpu.read(0x200, 3)) == 23400
+
+
+def test_edit_expands_digits_and_suppresses_leading_zeros():
+    # Fill 0x40, a significance starter then four digit selectors, source 1234.
+    pattern = bytes([0x40, 0x21, 0x20, 0x20, 0x20, 0x20])
+    cpu = CPU()
+    cpu.write(0x200, pattern)
+    cpu.write(0x300, bytes.fromhex("01234C"))
+    cpu.load(BASE, encode("ED", 5, 2, 0, 0x200, 0, 0x300))
+    cpu.psw.ia = BASE
+    cpu.step()
+    # Hand-traced: the message character at 0 takes the fill; the starter sees
+    # the leading 0 and also takes the fill; the four selectors then place
+    # 1, 2, 3 and 4. The final digit carries the plus sign, which turns the
+    # significance indicator off again.
+    assert cpu.read(0x200, 6) == bytes([0x40, 0x40, 0xF1, 0xF2, 0xF3, 0xF4])
+    assert cpu.cc == 2        # nonzero field, indicator off at the end
+
+
+def test_edit_suppresses_leading_zeros():
+    # Source 007 with selectors: the leading zeros become the fill character.
+    pattern = bytes([0x40, 0x20, 0x20, 0x20])
+    cpu = CPU()
+    cpu.write(0x200, pattern)
+    cpu.write(0x300, bytes.fromhex("007C"))
+    cpu.load(BASE, encode("ED", 3, 1, 0, 0x200, 0, 0x300))
+    cpu.psw.ia = BASE
+    cpu.step()
+    # Pattern is fill + three selectors; the first two see zeros with the
+    # indicator off, so they emit the fill and only the 7 is placed.
+    assert cpu.read(0x200, 4) == bytes([0x40, 0x40, 0x40, 0xF7])
+    assert cpu.cc == 2
+
+
+def test_edit_and_mark_records_the_first_significant_position():
+    pattern = bytes([0x40, 0x20, 0x20, 0x20])
+    cpu = CPU()
+    cpu.write(0x200, pattern)
+    cpu.write(0x300, bytes.fromhex("007C"))
+    cpu.load(BASE, encode("EDMK", 3, 1, 0, 0x200, 0, 0x300))
+    cpu.psw.ia = BASE
+    cpu.r[1] = 0
+    cpu.step()
+    # The 7 is the first digit actually placed, at pattern offset 3.
+    assert cpu.r[1] & 0xFFFFFF == 0x203
+
+
+def test_edit_rejects_an_invalid_source_digit():
+    pattern = bytes([0x40, 0x20, 0x20])
+    cpu = CPU()
+    cpu.write(0x200, pattern)
+    cpu.write(0x300, bytes.fromhex("AB1C"))
+    cpu.load(BASE, encode("ED", 2, 1, 0, 0x200, 0, 0x300))
+    cpu.psw.ia = BASE
+    with pytest.raises(ProgramCheck) as info:
+        cpu.step()
+    assert info.value.code == 0x07

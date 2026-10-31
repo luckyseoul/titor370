@@ -89,12 +89,15 @@ Implemented and tested: `AR SR ALR SLR LR LTR LNR LPR LCR NR OR XR CR CLR MR DR`
 `BALR BCTR BCR SVC MVCL CLCL`, `L ST LA LH STH IC STC A S AL SL N O X C CL M D AH SH CH MH
 CVD CVB`, `EX BAL BCT BC LRA`, `SLL SRL SLA SRA SLDL SRDL SLDA SRDA STM LM BXH BXLE CS CDS
 CLM STCM ICM`, `TM MVI NI OI XI CLI`, `MVC MVN MVZ NC OC XC CLC TR TRT PACK UNPK`, `TS DIAG`,
-and packed decimal: `AP SP MP DP ZAP CP`.
+and the whole packed-decimal feature: `AP SP MP DP ZAP CP MVO SRP ED EDMK`.
 
 Deliberately **not** implemented, and they raise a program check rather than pretending:
-`SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH`; the decimal *editing* and shift
-instructions (`ED EDMK SRP MVO`); **all floating point**, which the 5100 did not have either;
-`LPSW` and `SSM` (privileged); and DAT.
+`SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH`; **all floating point**, which the 5100
+did not have either; `LPSW` and `SSM` (privileged); and DAT.
+
+The decimal feature is complete: arithmetic, `MVO`, `SRP` with its rounding factor, and the
+`ED`/`EDMK` editing instructions with the significance indicator and fill character. All are
+translated to C as well.
 
 ## Design notes worth knowing
 
@@ -205,7 +208,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-950 passed, 1 skipped
+971 passed
 ```
 
 Three kinds of test:
@@ -277,7 +280,8 @@ make the interpreter and the translator disagree if either is wrong.
 | `strings.s370` | MVC, TRT, TR with a 256-byte EBCDIC case table |
 | `search.s370` | BAL/BCR subroutine call and return, BXLE table walk |
 | `packed.s370` | CVD/CVB, PACK/UNPK, ICM/STCM, 64-bit shift, compare-and-swap |
-| `decimal.s370` | packed-decimal arithmetic (runs; the translator does not emit it) |
+| `decimal.s370` | packed-decimal arithmetic |
+| `decimal2.s370` | decimal sweep including `MVO` and `SRP`, translated and compared |
 | `mvcl.s370` | MOVE LONG with padding, COMPARE LOGICAL LONG |
 | `cds.s370` | COMPARE DOUBLE AND SWAP |
 | `shifts.s370` | shift amounts of 32 and above, arithmetic vs logical |
@@ -296,8 +300,7 @@ make the interpreter and the translator disagree if either is wrong.
   `BALR r,0` are propagated so ordinary `USING`-style code resolves correctly.
 - **No decimal arithmetic.** `AP`/`SP`/`MP`/`DP`/`ZAP` and friends are unimplemented; `PACK`,
   `UNPK`, `CVD` and `CVB` are implemented and tested.
-- **Not translated:** SVC, EX, LPSW, SSM, LRA, and the decimal arithmetic of the previous
-  section. The interpreter runs these (or
+- **Not translated:** SVC, EX, LPSW, SSM, LRA, ED, EDMK. The interpreter runs these (or
   raises for the privileged ones); the C translator does not emit code for them, and
   `tests/test_coverage.py` fails if this list and the code disagree.
 - **Self-modifying programs are not translated.** The generated C checks every store against

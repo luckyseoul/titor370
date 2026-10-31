@@ -549,18 +549,77 @@ def test_lra_is_privileged():
         run_one("LRA", fields=(1, 0, 0, 0x200))
 
 
-@pytest.mark.parametrize("name", ["ED", "EDMK", "SRP", "MVO"])
-def test_unimplemented_decimal_instructions_are_operation_exceptions(name):
-    # These parts of the decimal feature are not implemented; that is an
-    # operation exception, not a privileged-operation exception.
-    from titor370.cpu import OperationException
+# ---------------------------------------------------------------------------
+# Execute
+# ---------------------------------------------------------------------------
 
+
+def test_ex_executes_the_subject_with_the_mask_ored_in():
     cpu = CPU()
-    cpu.load(BASE, encode(name, 1, 1, 0, 0x200, 0, 0x300))
+    cpu.load(0x1000, encode("EX", 1, 0, 0, 0x300))
+    cpu.load(0x300, encode("MVI", 0x40, 2, 0))   # MVI 0(2),X'40'
+    cpu.r[1] = 0x05
+    cpu.r[2] = 0x200
+    cpu.psw.ia = 0x1000
+    cpu.step()
+    assert cpu.fetch_byte(0x200) == 0x45         # 0x40 | 0x05
+    assert cpu.psw.ia == 0x1004                  # advance by EX's length, not the subject's
+    assert cpu.read(0x300, 4) == encode("MVI", 0x40, 2, 0)  # subject left intact
+
+
+def test_mvn_moves_numerics_and_mvz_moves_zones():
+    # MVN moves the numeric (low-order four) bits of each source byte.
+    cpu = run_one("MVN", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
+    assert cpu.read(0x200, 2) == b"\xFA\xFB"
+    # MVZ moves the zones (high-order four bits).
+    cpu = run_one("MVZ", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
+    assert cpu.read(0x200, 2) == b"\x31\x42"
+
+
+# ---------------------------------------------------------------------------
+# Privileged and unimplemented
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["SSM", "LPSW", "STNSM", "STOSM"])
+def test_privileged_instructions_raise(name):
+    fields = (0, 0x200) if name in ("SSM", "LPSW") else (0xF0, 0, 0x200)
+    with pytest.raises(PrivilegedOperation):
+        run_one(name, fields=fields)
+
+
+# ---------------------------------------------------------------------------
+# Rules established by the independent review against Hercules
+# ---------------------------------------------------------------------------
+
+
+def test_bal_link_word_carries_ilc_cc_and_mask():
+    # "The link information ... consists of the instruction-length code, the
+    # condition code, the program mask bits, and the updated instruction
+    # address" (GA22-7000-4, p. 121). BAL is four bytes, so ILC = 2.
+    cpu = CPU()
+    cpu.load(BASE, encode("BAL", 14, 0, 0, 0x200))
+    cpu.psw.cc = 2
+    cpu.psw.pmask = 0x9
     cpu.psw.ia = BASE
-    with pytest.raises(OperationException) as info:
-        cpu.step()
-    assert info.value.code == 0x01
+    cpu.step()
+    assert cpu.r[14] == (2 << 30) | (2 << 28) | (0x9 << 24) | (BASE + 4)
+    assert cpu.psw.ia == 0x200
+
+
+def test_cs_requires_word_alignment():
+    with pytest.raises(SpecificationException):
+        run_one("CS", regs={1: 1, 3: 2}, mem={0x201: b"\x00\x00\x00\x00"}, fields=(1, 3, 0, 0x201))
+
+
+def test_cds_requires_doubleword_alignment():
+    with pytest.raises(SpecificationException):
+        run_one("CDS", regs={2: 1, 3: 2, 4: 3, 5: 4}, mem={0x204: bytes(8)}, fields=(2, 4, 0, 0x204))
+
+
+def test_lra_is_privileged():
+    with pytest.raises(PrivilegedOperation):
+        run_one("LRA", fields=(1, 0, 0, 0x200))
 
 
 def test_ex_of_ex_is_an_execute_exception():

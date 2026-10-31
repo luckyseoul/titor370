@@ -126,9 +126,7 @@ def cmd_compare(args) -> int:
     from .isa import OPCODES
 
     used = {w for w in pathlib.Path(args.source).read_text().split() if w in OPCODES}
-    untranslatable = used & {"AP", "SP", "MP", "DP", "ZAP", "CP",
-                             "EX", "SVC", "SSM", "LPSW", "LRA", "ED", "EDMK",
-                             "SRP", "MVO"}
+    untranslatable = used & {"EX", "SVC", "SSM", "LPSW", "LRA", "ED", "EDMK"}
     if untranslatable:
         print(f"SKIP  uses {', '.join(sorted(untranslatable))}, which the translator does not emit")
         return 0
