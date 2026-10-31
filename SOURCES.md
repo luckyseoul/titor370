@@ -75,6 +75,21 @@ One rule the review stated too broadly is worth recording: `PACK`/`UNPK`/`MVO` a
 operations have two 4-bit length fields, but `MVC`, `TR`, `TRT`, `CLC` and the rest have a
 single 8-bit length. Both forms are implemented.
 
+## Appendix E as an automated oracle
+
+`tests/test_cc_conformance.py` encodes Appendix E (printed p. 275), the manual's table of which
+condition codes each instruction can produce. Two things are asserted per instruction: that no
+code outside the table is ever produced, and that every code inside it is reachable.
+
+That second assertion is a test-quality guard, not a semantic one. Without it, an instruction
+whose sweep never completes passes the first assertion vacuously — which is what happened to
+`MVCL`, `CLCL` and `TS` when the file was first written. Four more instructions were not
+reaching their full allowed set for the same reason. Both problems were in the sweep, and both
+were fixed there.
+
+The table is only as good as the OCR of that page, so the page image was checked directly:
+the blank CC-0 cell for `SUBTRACT LOGICAL` is present in the scan, not an extraction artefact.
+
 ## Known limits of this derivation
 
 - **OCR is not proof.** Where the text layer was legible and unopposed by a second source, it

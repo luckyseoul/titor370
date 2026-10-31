@@ -110,6 +110,35 @@ Four rules that are easy to get wrong, and that this implementation gets right:
    one byte to the right yields `AAAAA`, not a memmove'd result.
 
 
+## A condition-code oracle from the manual
+
+`tests/test_cc_conformance.py` encodes Appendix E of the Principles of Operation — IBM's own
+table of which of the four condition codes each instruction can produce — and checks the
+implementation against it.
+
+That table is an oracle written by IBM rather than by this project, and it catches a class of
+bug that hand-written tests miss. `SUBTRACT LOGICAL` is the example: its CC-0 column in the
+manual is blank, because "a zero difference cannot be obtained without a carry out of the sign
+position". An earlier version of this emulator produced CC 0 anyway, and every per-instruction
+test agreed with it, because the tests and the code shared the same misreading.
+
+The test sweeps each instruction over edge-case operands and asserts two things:
+
+- no instruction ever produces a condition code outside its documented set, and
+- every condition code the manual allows is actually reachable by the sweep.
+
+The second assertion exists because the first is trivially satisfied by a test that never runs
+the instruction. When this file was first written, three instructions (`MVCL`, `CLCL`, `TS`)
+were passing vacuously for exactly that reason, and four more were not reaching their full set.
+The sweep was fixed rather than the assertion relaxed.
+
+To confirm the oracle has teeth, the `SLR` bug was reintroduced deliberately: the test fails,
+naming the instruction and the illegal code.
+
+It does **not** catch every kind of error — `TS` produced the wrong condition code for a
+different reason (zero-ness instead of the leftmost bit) and stayed inside its legal set {0,1}.
+A condition-code oracle bounds the damage; it does not replace reading the page.
+
 ## An independent review
 
 `REVIEW.md` records a review of this project against Hercules, a mature System/370 emulator,
@@ -137,7 +166,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-620 passed
+709 passed
 ```
 
 Three kinds of test:
