@@ -149,6 +149,13 @@ TWO_BYTE_OPS: dict[str, tuple[int, int, Fmt]] = {
     "TCH": (0x9F, 0x00, Fmt.S),
 }
 
+# SS instructions whose length byte holds two independent 4-bit fields L1 and
+# L2 (decimal and pack/unpack operations). All other SS instructions carry a
+# single 8-bit length applying to both operands.
+SS_TWO_LENGTHS = {
+    "MVO", "PACK", "UNPK", "ZAP", "CP", "AP", "SP", "MP", "DP",
+}
+
 MNEMONIC_BY_CODE: dict[int, str] = {}
 for _name, (_op, _fmt) in OPCODES.items():
     MNEMONIC_BY_CODE.setdefault(_op, _name)
@@ -175,8 +182,14 @@ class Instruction:
     r2: int = 0
     r3: int = 0
     i2: int = 0
-    l: int = 0
+    l1: int = 0
+    l2: int = 0
     raw: bytes = b""
+
+    @property
+    def l(self) -> int:
+        """Length field of a one-length SS instruction."""
+        return self.l1
 
     @property
     def hex(self) -> str:
@@ -237,9 +250,13 @@ def decode(mem: bytes | bytearray, address: int) -> Instruction:
 
     if fmt is Fmt.SS:
         raw = bytes(mem[address : address + 6])
+        if name in SS_TWO_LENGTHS:
+            l1, l2 = raw[1] >> 4, raw[1] & 0x0F
+        else:
+            l1 = l2 = raw[1]
         return Instruction(
             address, op, name, fmt, 6,
-            l=raw[1],
+            l1=l1, l2=l2,
             b1=raw[2] >> 4, d1=((raw[2] & 0x0F) << 8) | raw[3],
             b2=raw[4] >> 4, d2=((raw[4] & 0x0F) << 8) | raw[5],
             raw=raw,
@@ -276,9 +293,15 @@ def encode(name: str, *fields: int) -> bytes:
         return bytes([op, i2 & 0xFF, ((b2 & 0xF) << 4) | ((d2 >> 8) & 0xF), d2 & 0xFF])
 
     if fmt is Fmt.SS:
-        l, b1, d1, b2, d2 = fields
+        if len(fields) == 5:
+            # Convenience: one length for both operands.
+            l1, b1, d1, b2, d2 = fields
+            l2 = l1
+        else:
+            l1, l2, b1, d1, b2, d2 = fields
+        length_byte = (((l1 & 0xF) << 4) | (l2 & 0xF)) if name in SS_TWO_LENGTHS else (l1 & 0xFF)
         return bytes([
-            op, l & 0xFF,
+            op, length_byte,
             ((b1 & 0xF) << 4) | ((d1 >> 8) & 0xF), d1 & 0xFF,
             ((b2 & 0xF) << 4) | ((d2 >> 8) & 0xF), d2 & 0xFF,
         ])

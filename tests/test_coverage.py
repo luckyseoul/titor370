@@ -15,7 +15,7 @@ from titor370.translate import emit
 
 # Instructions the interpreter runs but the C translator does not emit.
 # Keep in sync with the README's "Limits" section.
-NOT_TRANSLATED = {"SVC", "MVCL", "CLCL", "EX", "CDS", "LPSW", "SSM"}
+NOT_TRANSLATED = {"SVC", "MVCL", "CLCL", "EX", "CDS", "LPSW", "SSM", "LRA"}
 
 
 def _synthetic(name: str) -> Instruction:
@@ -24,7 +24,7 @@ def _synthetic(name: str) -> Instruction:
         0x1000, op, name, fmt,
         {Fmt.RR: 2, Fmt.SS: 6}.get(fmt, 4),
         b1=2, d1=0x200, b2=3, d2=0x210,
-        r1=2, r2=4, r3=6, i2=0x40, l=3,
+        r1=2, r2=4, r3=6, i2=0x40, l1=3, l2=3,
         raw=bytes([op, 0x24, 0x02, 0x00, 0x03, 0x10]),
     )
 
@@ -45,7 +45,9 @@ def test_translator_covers_everything_but_the_documented_exceptions():
         if name not in OPCODES:
             continue
         emitted = "\n".join(emit(_synthetic(name), {}))
-        if re.search(r'unimplemented\([^,]+, "' + re.escape(name) + r'"', emitted):
+        # Only a static "not translated" counts; runtime guards such as the
+        # divide-by-zero check are not coverage gaps.
+        if re.search(r'unimplemented\([^,]+, "' + re.escape(name) + r' is not translated"', emitted):
             untranslated.add(name)
     assert untranslated == NOT_TRANSLATED, (
         f"coverage changed: translator does not handle {sorted(untranslated - NOT_TRANSLATED)}, "

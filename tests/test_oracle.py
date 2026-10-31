@@ -72,9 +72,11 @@ def test_logical_add_and_subtract_match_python(a, b):
     assert cc == (2 if carry else 0) + (1 if result else 0)
 
     result, cc = execute("SLR", a, b)
-    borrow = b > a
+    # Carry out of the sign position: a >= b. CC 1 nonzero/no carry,
+    # 2 zero/carry, 3 nonzero/carry; CC 0 is unreachable.
+    carry = a >= b
     assert result == (a - b) & 0xFFFFFFFF
-    assert cc == (2 if borrow else 0) + (1 if result else 0)
+    assert cc == (2 if carry else 0) + (1 if result else 0)
 
 
 @pytest.mark.parametrize("a", EDGES)
@@ -97,7 +99,7 @@ def test_multiply_and_divide_match_python(seed):
 
         cpu = CPU()
         cpu.load(0x1000, encode("MR", 4, 6))
-        cpu.r[4] = a
+        cpu.r[5] = a          # the multiplicand is the ODD register
         cpu.r[6] = b
         cpu.psw.ia = 0x1000
         cpu.step()
@@ -119,5 +121,6 @@ def test_multiply_and_divide_match_python(seed):
             q = -q
         r = dividend - q * s32(b)
         if -2**31 <= q < 2**31:
-            assert cpu.r[4] == q & 0xFFFFFFFF
-            assert cpu.r[5] == r & 0xFFFFFFFF
+            # Remainder in the even register, quotient in the odd one.
+            assert cpu.r[4] == r & 0xFFFFFFFF
+            assert cpu.r[5] == q & 0xFFFFFFFF

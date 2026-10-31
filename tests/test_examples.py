@@ -48,10 +48,12 @@ def test_strings_program_copies_searches_and_translates():
     expected = "HELLO WORLD".encode("cp037")
     assert got == expected
 
-    # TRT found lower-case 'o' at offset 4 and reported tag 1.
-    assert cpu.r[1] == 1
-    assert cpu.r[2] == copy + 4
-    assert cpu.cc == 2
+    # TRT found lower-case 'o' at offset 4: the argument address goes in R1
+    # and the function byte in R2 (GA22-7000-4, p. 146). Bytes remain after
+    # it, so the condition code is 1.
+    assert cpu.r[1] == copy + 4
+    assert cpu.r[2] == 1
+    assert cpu.cc == 1
 
 
 def test_privileged_instruction_is_reported():

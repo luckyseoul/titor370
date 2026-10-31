@@ -91,6 +91,16 @@ static void unimplemented(uint32_t at, const char *what)
     fprintf(stderr, "titor370: unimplemented at %06X: %s\n", at, what);
     exit(3);
 }
+
+/* Static translation cannot follow a store into the code it was generated
+ * from: the interpreter would decode the new bytes, this program cannot. */
+static void store_guard(uint32_t addr, unsigned len)
+{
+    uint32_t lo = addr & MASK24, hi = lo + len;
+    for (unsigned i = 0; i < CODE_RANGES; i++)
+        if (lo < code_ranges[i][1] && hi > code_ranges[i][0])
+            unimplemented(addr, "store into translated code (self-modifying program)");
+}
 """
 
 
@@ -98,111 +108,136 @@ class TranslateError(Exception):
     pass
 
 
-def _branch_target(ins: Instruction, bases: dict[int, int] | None = None) -> int | None:
+def _branch_target(ins: Instruction, bases: dict[int, set[int]] | None = None,
+                   base_value: int | None = None) -> int | None:
     """Statically known branch target, or None when it cannot be resolved.
 
-    *bases* maps a register to the constant it holds, learned from the
-    ``BALR r,0`` base-register idiom; with it, ordinary USING-style branches
-    resolve to absolute addresses.
+    *bases* maps a register to every constant it is known to hold (learned from
+    the ``BALR r,0`` base-register idiom). With *base_value* supplied, a
+    specific value is assumed instead.
     """
     bases = bases or {}
     if ins.fmt is Fmt.RX:
         if ins.raw[1] & 0xF:
-            return None                      # index register: unknown at translation time
-        if ins.b2 == 0:
-            return ins.d2 & 0xFFFFFF
-        if ins.b2 in bases:
-            return (bases[ins.b2] + ins.d2) & 0xFFFFFF
+            return None                      # index register: not resolvable
+        base, disp = ins.b2, ins.d2
+    elif ins.fmt is Fmt.RS:
+        base, disp = ins.b2, ins.d2
+    else:
         return None
-    if ins.fmt is Fmt.RS:
-        if ins.b2 == 0:
-            return ins.d2 & 0xFFFFFF
-        if ins.b2 in bases:
-            return (bases[ins.b2] + ins.d2) & 0xFFFFFF
-        return None
+    if base == 0:
+        return disp & 0xFFFFFF
+    if base_value is not None:
+        return (base_value + disp) & 0xFFFFFF
+    known = bases.get(base)
+    if known and len(known) == 1:
+        return (next(iter(known)) + disp) & 0xFFFFFF
     return None
 
 
-def discover(memory: bytes | bytearray, entry: int) -> tuple[dict[int, Instruction], dict[int, int], bool]:
+def _base_candidates(ins: Instruction, bases: dict[int, set[int]]) -> list[tuple[int, int]]:
+    """All (register value, target) pairs a base-addressed branch could take."""
+    if ins.fmt not in (Fmt.RX, Fmt.RS) or ins.b2 == 0:
+        return []
+    if ins.fmt is Fmt.RX and (ins.raw[1] & 0xF):
+        return []
+    return [(value, (value + ins.d2) & 0xFFFFFF) for value in sorted(bases.get(ins.b2, ()))]
+
+
+def discover(memory: bytes | bytearray, entry: int):
     """Decode reachable code.
 
-    Returns (instructions by address, base-register constants, needs_dispatch).
+    Returns (instructions by address, base-register values by register,
+    needs_dispatch). Discovery runs to a fixpoint: every time a new base value
+    is learned, branches addressed through that register are re-resolved, so
+    two subroutines that each establish R12 are both covered.
     """
     code: dict[int, Instruction] = {}
-    bases: dict[int, int] = {}
+    bases: dict[int, set[int]] = {}
     needs_dispatch = False
     pending = [entry & 0xFFFFFF]
 
-    while pending:
-        addr = pending.pop()
-        while True:
-            if addr in code:
-                break
-            try:
-                ins = decode(memory, addr)
-            except ValueError:
-                # Not code: data tables, padding, or a fall-through that is
-                # never actually taken. Stop this path; if the program really
-                # branches here, the dispatch will report it.
-                break
-            code[addr] = ins
-            nxt = (addr + ins.length) & 0xFFFFFF
-            name = ins.name
+    def walk() -> None:
+        nonlocal needs_dispatch
+        while pending:
+            addr = pending.pop()
+            while True:
+                if addr in code:
+                    break
+                try:
+                    ins = decode(memory, addr)
+                except ValueError:
+                    break
+                code[addr] = ins
+                nxt = (addr + ins.length) & 0xFFFFFF
+                name = ins.name
 
-            # BALR r,0 loads the address of the next instruction into r; that
-            # is how 370 code establishes a base for its 12-bit displacements.
-            if name == "BALR" and ins.r2 == 0:
-                bases[ins.r1] = nxt
+                if name == "BALR" and ins.r2 == 0:
+                    bases.setdefault(ins.r1, set()).add(nxt)
 
-            if name in ("BCR", "BALR", "BCTR"):
-                if ins.r2 == 0:
-                    # "When the R2 field is zero, the instruction does not
-                    # branch" -- this is the BALR 12,0 base-register idiom.
-                    addr = nxt
-                    continue
-                # A register branch may or may not be taken, and a BALR is
-                # usually a call whose return lands on the next instruction.
-                pending.append(nxt)
-                needs_dispatch = True
-                break
-            if name in ("DIAG", "SVC"):
-                break
-            if name == "BC":
-                target = _branch_target(ins, bases)
-                if target is not None:
-                    pending.append(target)
-                if ins.r1 == 15:
-                    break  # unconditional
-                pending.append(nxt)
-                break
-            if name == "BAL":
-                target = _branch_target(ins, bases)
-                if target is not None:
-                    pending.append(target)
-                else:
+                if name in ("BCR", "BALR", "BCTR"):
+                    if ins.r2 == 0:
+                        addr = nxt
+                        continue
+                    pending.append(nxt)
                     needs_dispatch = True
-                # The instruction after BAL is the subroutine's return point,
-                # reached through the BR the subroutine ends with.
-                pending.append(nxt)
-                break
-            if name == "BCT":
-                target = _branch_target(ins, bases)
-                if target is not None:
-                    pending.append(target)
-                else:
-                    needs_dispatch = True
-                pending.append(nxt)
-                break
-            if name in ("BXH", "BXLE"):
-                target = _branch_target(ins, bases)
-                if target is not None:
-                    pending.append(target)
-                else:
-                    needs_dispatch = True
-                pending.append(nxt)
-                break
+                    break
+                if name in ("DIAG", "SVC"):
+                    break
+                if name == "BC":
+                    target = _branch_target(ins)
+                    if target is not None:
+                        pending.append(target)
+                    elif ins.b2:
+                        needs_dispatch = True
+                    if ins.r1 == 15:
+                        break
+                    pending.append(nxt)
+                    break
+                if name == "BAL":
+                    target = _branch_target(ins)
+                    if target is not None:
+                        pending.append(target)
+                    else:
+                        needs_dispatch = True
+                    pending.append(nxt)
+                    break
+                if name == "BCT":
+                    target = _branch_target(ins)
+                    if target is not None:
+                        pending.append(target)
+                    else:
+                        needs_dispatch = True
+                    pending.append(nxt)
+                    break
+                if name in ("BXH", "BXLE"):
+                    target = _branch_target(ins)
+                    if target is not None:
+                        pending.append(target)
+                    else:
+                        needs_dispatch = True
+                    pending.append(nxt)
+                    break
+                addr = nxt
 
-            addr = nxt
+    attempted: set[int] = set()
+    while True:
+        walk()
+        added = False
+        for ins in list(code.values()):
+            for _value, target in _base_candidates(ins, bases):
+                if target not in code and target not in attempted:
+                    attempted.add(target)
+                    pending.append(target)
+                    added = True
+        if not added and not pending:
+            break
+
+    # Any base-addressed branch whose targets we could not enumerate needs the
+    # dispatch table at run time.
+    for ins in code.values():
+        if ins.name in ("BC", "BAL", "BCT", "BXH", "BXLE") and ins.b2:
+            needs_dispatch = True
 
     return code, bases, needs_dispatch
 
@@ -227,9 +262,26 @@ def translate(
     parts: list[str] = [PRELUDE]
     if title:
         parts.append(f"/* {title} */\n")
+
+    # The code-range table must precede the runtime, whose store_guard
+    # function walks it.
+    ranges: list[tuple[int, int]] = []
+    for addr in sorted(code):
+        end = addr + code[addr].length
+        if ranges and addr == ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], end)
+        else:
+            ranges.append((addr, end))
+    parts.append(f"#define CODE_RANGES {len(ranges)}u")
+    parts.append("static const uint32_t code_ranges[CODE_RANGES][2] = {")
+    for lo, hi in ranges:
+        parts.append(f"    {{0x{lo:06X}u, 0x{hi:06X}u}},")
+    parts.append("};")
+    parts.append("")
     parts.append(RUNTIME)
 
     parts.append(f"#define PROGRAM_BASE 0x{base:06X}u")
+    parts.append("#define PROGRAM_MASK 0x0u")
     parts.append(f"#define PROGRAM_LEN  {len(image)}u")
     parts.append(f"#define WINDOW_BASE 0x{window_base:06X}u")
     parts.append(f"#define WINDOW_LEN  {window_len}u")
@@ -245,20 +297,23 @@ def translate(
     parts.append("};")
     parts.append("")
 
+
     body: list[str] = ["static void s370_run(void)", "{"]
+    # Start where the program starts, not at the lowest translated address.
+    body.append(f"    goto L_{entry & 0xFFFFFF:06X};")
     for addr in sorted(code):
         ins = code[addr]
         body.append(f"L_{addr:06X}: /* {addr:06X}  {ins.name} {ins.hex} */")
-        body.extend("    " + line for line in emit(ins, bases))
+        body.extend("    " + line for line in emit(ins, bases, guard=True, known=set(code)))
     body.append("done:")
     body.append("    return;")
-    if needs_dispatch:
-        body.append("dispatch:")
-        body.append("    switch (IA) {")
-        for addr in sorted(code):
-            body.append(f"    case 0x{addr:06X}u: goto L_{addr:06X};")
-        body.append('    default: unimplemented(IA, "computed branch outside translated code");')
-        body.append("    }")
+    # The dispatch label is always emitted: an indexed branch may need it.
+    body.append("dispatch:")
+    body.append("    switch (IA) {")
+    for addr in sorted(code):
+        body.append(f"    case 0x{addr:06X}u: goto L_{addr:06X};")
+    body.append('    default: unimplemented(IA, "computed branch outside translated code");')
+    body.append("    }")
     body.append("}")
     parts.append("\n".join(body))
     parts.append("")
@@ -285,28 +340,61 @@ def translate(
     return "\n".join(parts)
 
 
-def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
-    """C statements for one instruction; IA is left pointing at the next fetch."""
+def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
+         guard: bool = False, known: set[int] | None = None) -> list[str]:
+    """C statements for one instruction; IA is left pointing at the next fetch.
+
+    Semantics mirror cpu.py rule for rule, each citing the same page of
+    GA22-7000-4. When *guard* is set, stores are checked against the translated
+    code so that a self-modifying program is reported rather than silently
+    mis-executed.
+    """
     name = ins.name
     nxt = f"IA = 0x{(ins.address + ins.length) & 0xFFFFFF:06X}u;"
-    b2, d2 = ins.b2, ins.d2
-    b1, d1, L = ins.b1, ins.d1, ins.l
+    b1, d1, b2, d2 = ins.b1, ins.d1, ins.b2, ins.d2
+    L1, L2 = ins.l1, ins.l2
     x = ins.raw[1] & 0xF if ins.fmt is Fmt.RX else 0
     r1, r2, r3 = ins.r1, ins.r2, ins.r3
+    bases = bases or {}
+    # Only addresses that were actually translated may be jumped to.
+    known = known if known is not None else set()
 
-    # Shift counts use the low six bits of the second-operand address, base
-    # register included (GA22-7000-4: "the second-operand address is not used
-    # to address data; its low-order six bits indicate the number of bits").
     SH = f"({(f'(R[{b2}] + {d2}u)' if b2 else f'{d2}u')} & 0x3Fu)"
     A = f"ea({b2}u, {x}u, {d2}u)"       # RX second operand
     S = f"ea({b2}u, 0u, {d2}u)"         # S / SI / RS address
     D1 = f"ea({b1}u, 0u, {d1}u)"        # SS first operand
     D2 = f"ea({b2}u, 0u, {d2}u)"        # SS second operand
 
+    out: list[str] = []
+
+    def store(addr: str, length: str) -> None:
+        if guard:
+            out.append(f"store_guard({addr}, {length});")
+
+    def link_word(ilc: int) -> str:
+        return (f"((uint32_t)({ilc}u) << 30) | ((uint32_t)(CC & 3) << 28)"
+                f" | ((uint32_t)(PROGRAM_MASK & 0xFu) << 24)"
+                f" | 0x{(ins.address + ins.length) & 0xFFFFFF:06X}u")
+
+    store_byte_ops = {"MVI", "NI", "OI", "XI", "TS"}
+    if name in ("ST", "STH", "STC", "MVI", "NI", "OI", "XI", "TS", "CVD",
+                "STCM", "CS", "CDS"):
+        length = {"ST": 4, "CVD": 8, "STH": 2, "STCM": 0, "CS": 4, "CDS": 8}.get(name, 1)
+        if name == "STCM":
+            store(S, f"{bin(ins.r3).count('1') or 1}u")
+        else:
+            store(S if name not in ("ST", "STH", "STC", "CVD") else A, str(length))
+    if name in ("MVC", "MVN", "MVZ", "NC", "OC", "XC", "TR", "PACK", "UNPK"):
+        store(D1, f"{L1 + 1}u")
+
     fixed = {
         "LR": f"R[{r1}] = R[{r2}];",
         "LTR": f"R[{r1}] = R[{r2}]; CC = cc_of((int32_t)R[{r1}]);",
-        "LNR": f"R[{r1}] = (uint32_t)(-(int32_t)R[{r2}]); CC = cc_of((int32_t)R[{r1}]);",
+        # LOAD NEGATIVE is -abs(x): negative numbers are unchanged (p. 132).
+        "LNR": (
+            f"{{ int32_t v = (int32_t)R[{r2}]; R[{r1}] = (v < 0) ? (uint32_t)v : (uint32_t)(-v);"
+            f" CC = (R[{r1}] == 0) ? 0 : 1; }}"
+        ),
         "LPR": (
             f"{{ int32_t v = (int32_t)R[{r2}]; R[{r1}] = (uint32_t)(v == INT32_MIN ? v : (v < 0 ? -v : v));"
             f" if (v == INT32_MIN) CC = 3; else CC = (v == 0) ? 0 : 2; }}"
@@ -349,60 +437,75 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
             f" if (n >= 32u) R[{r1}] = (v < 0) ? 0xFFFFFFFFu : 0u; else R[{r1}] = (uint32_t)(v >> n);"
             f" CC = cc_of((int32_t)R[{r1}]); }}"
         ),
+        # SLA keeps the sign bit; only the 31 integer bits shift (p. 139).
         "SLA": (
-            f"{{ unsigned n = (unsigned){SH}; int32_t v0 = (int32_t)R[{r1}];"
-            f" if (n >= 32u) {{ R[{r1}] = 0u; CC = 3; }}"
-            f" else {{ int64_t s = (int64_t)v0 * (int64_t)(1ull << n); R[{r1}] = (uint32_t)s;"
-            f" CC = (s == 0) ? 0 : ((s < 0) ? 1 : 2);"
-            f" if (s > 2147483647LL || s < -2147483648LL) CC = 3; }} }}"
+            f"{{ unsigned n = (unsigned){SH}; uint32_t v = R[{r1}]; uint32_t sign = v & 0x80000000u;"
+            f" uint32_t mag = v & 0x7FFFFFFFu; int ovf = 0;"
+            f" if (n) {{ uint32_t lost = (n < 31u) ? (mag >> (31u - n)) : mag;"
+            f" uint32_t expected = sign ? ((n < 31u) ? ((1u << n) - 1u) : 0x7FFFFFFFu) : 0u;"
+            f" ovf = (lost != expected); }}"
+            f" R[{r1}] = sign | ((mag << n) & 0x7FFFFFFFu);"
+            f" CC = ovf ? 3 : ((R[{r1}] == 0) ? 0 : ((R[{r1}] & 0x80000000u) ? 1 : 2)); }}"
         ),
-        "TS": f"{{ uint32_t v = ld8({S}); st8({S}, 0xFFu); CC = (v == 0) ? 0 : 1; }}",
-        "LRA": f"R[{r1}] = {A};",
-        "MVC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; for (unsigned k = 0; k < {L + 1}u; k++) M[(d0 + k) & MASK24] = M[(s0 + k) & MASK24]; }}",
-        "MVN": f"{{ uint32_t d0 = {D1}, s0 = {D2}; for (unsigned k = 0; k < {L + 1}u; k++) M[(d0 + k) & MASK24] = (uint8_t)((M[(d0 + k) & MASK24] & 0x0Fu) | (M[(s0 + k) & MASK24] & 0xF0u)); }}",
-        "MVZ": f"{{ uint32_t d0 = {D1}, s0 = {D2}; for (unsigned k = 0; k < {L + 1}u; k++) M[(d0 + k) & MASK24] = (uint8_t)((M[(d0 + k) & MASK24] & 0xF0u) | (M[(s0 + k) & MASK24] & 0x0Fu)); }}",
-        "NC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; int nz = 0; for (unsigned k = 0; k < {L + 1}u; k++) {{ uint8_t v = M[(d0 + k) & MASK24] & M[(s0 + k) & MASK24]; M[(d0 + k) & MASK24] = v; nz |= v; }} CC = nz ? 1 : 0; }}",
-        "OC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; int nz = 0; for (unsigned k = 0; k < {L + 1}u; k++) {{ uint8_t v = M[(d0 + k) & MASK24] | M[(s0 + k) & MASK24]; M[(d0 + k) & MASK24] = v; nz |= v; }} CC = nz ? 1 : 0; }}",
-        "XC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; int nz = 0; for (unsigned k = 0; k < {L + 1}u; k++) {{ uint8_t v = M[(d0 + k) & MASK24] ^ M[(s0 + k) & MASK24]; M[(d0 + k) & MASK24] = v; nz |= v; }} CC = nz ? 1 : 0; }}",
+        # TS sets CC from the leftmost bit of the old byte (p. 144).
+        "TS": f"{{ uint32_t v = ld8({S}); st8({S}, 0xFFu); CC = (v & 0x80u) ? 1 : 0; }}",
+        "MVC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; for (unsigned k = 0; k < {L1 + 1}u; k++) M[(d0 + k) & MASK24] = M[(s0 + k) & MASK24]; }}",
+        # MVN moves the numeric (low) bits; MVZ the zones (high) (p. 136).
+        "MVN": f"{{ uint32_t d0 = {D1}, s0 = {D2}; for (unsigned k = 0; k < {L1 + 1}u; k++) M[(d0 + k) & MASK24] = (uint8_t)((M[(d0 + k) & MASK24] & 0xF0u) | (M[(s0 + k) & MASK24] & 0x0Fu)); }}",
+        "MVZ": f"{{ uint32_t d0 = {D1}, s0 = {D2}; for (unsigned k = 0; k < {L1 + 1}u; k++) M[(d0 + k) & MASK24] = (uint8_t)((M[(d0 + k) & MASK24] & 0x0Fu) | (M[(s0 + k) & MASK24] & 0xF0u)); }}",
+        "NC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; int nz = 0; for (unsigned k = 0; k < {L1 + 1}u; k++) {{ uint8_t v = M[(d0 + k) & MASK24] & M[(s0 + k) & MASK24]; M[(d0 + k) & MASK24] = v; nz |= v; }} CC = nz ? 1 : 0; }}",
+        "OC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; int nz = 0; for (unsigned k = 0; k < {L1 + 1}u; k++) {{ uint8_t v = M[(d0 + k) & MASK24] | M[(s0 + k) & MASK24]; M[(d0 + k) & MASK24] = v; nz |= v; }} CC = nz ? 1 : 0; }}",
+        "XC": f"{{ uint32_t d0 = {D1}, s0 = {D2}; int nz = 0; for (unsigned k = 0; k < {L1 + 1}u; k++) {{ uint8_t v = M[(d0 + k) & MASK24] ^ M[(s0 + k) & MASK24]; M[(d0 + k) & MASK24] = v; nz |= v; }} CC = nz ? 1 : 0; }}",
         "CLC": (
             f"{{ uint32_t d0 = {D1}, s0 = {D2}; CC = 0;"
-            f" for (unsigned k = 0; k < {L + 1}u; k++) {{ uint8_t a = M[(d0 + k) & MASK24], c = M[(s0 + k) & MASK24];"
+            f" for (unsigned k = 0; k < {L1 + 1}u; k++) {{ uint8_t a = M[(d0 + k) & MASK24], c = M[(s0 + k) & MASK24];"
             f" if (a != c) {{ CC = (a < c) ? 1 : 2; break; }} }} }}"
         ),
-        "TR": f"{{ uint32_t d0 = {D1}, t0 = {D2}; for (unsigned k = 0; k < {L + 1}u; k++) M[(d0 + k) & MASK24] = M[(t0 + M[(d0 + k) & MASK24]) & MASK24]; }}",
+        "TR": f"{{ uint32_t d0 = {D1}, t0 = {D2}; for (unsigned k = 0; k < {L1 + 1}u; k++) M[(d0 + k) & MASK24] = M[(t0 + M[(d0 + k) & MASK24]) & MASK24]; }}",
+        # TRT: address into R1, function byte into R2 (p. 146).
         "TRT": (
-            f"{{ uint32_t d0 = {D1}, t0 = {D2}; unsigned k; CC = 0; R[2] = d0;"
-            f" for (k = 0; k < {L + 1}u; k++) {{ uint8_t f = M[(t0 + M[(d0 + k) & MASK24]) & MASK24];"
-            f" if (f) {{ R[1] = f; R[2] = d0 + k; CC = (k == 0) ? 1 : 2; break; }} }} }}"
+            f"{{ uint32_t d0 = {D1}, t0 = {D2}; unsigned n = {L1 + 1}u, k; CC = 0;"
+            f" for (k = 0; k < n; k++) {{ uint8_t f = M[(t0 + M[(d0 + k) & MASK24]) & MASK24];"
+            f" if (f) {{ R[1] = (R[1] & 0xFF000000u) | ((d0 + k) & MASK24);"
+            f" R[2] = (R[2] & 0xFFFFFF00u) | f;"
+            f" CC = (k == n - 1u) ? 2 : 1; break; }} }} }}"
         ),
+        # CLM compares contiguous storage bytes; a zero mask is CC 0 (p. 126).
         "CLM": (
-            f"{{ uint32_t a0 = {S}; static const unsigned msk[4] = {{0x80u, 0x08u, 0x80000000u, 0x8000000u}};"
-            f" (void)msk; int k; CC = 0;"
+            f"{{ uint32_t a0 = {S}; int k, pos = 0; CC = 0;"
             f" for (k = 0; k < 4; k++) {{ if (!(({r3}u >> (3 - k)) & 1u)) continue;"
-            f" uint8_t l = (uint8_t)(R[{r1}] >> (24 - 8 * k)), c = M[(a0 + k) & MASK24];"
+            f" uint8_t l = (uint8_t)(R[{r1}] >> (24 - 8 * k)), c = M[(a0 + pos) & MASK24]; pos++;"
             f" if (l != c) {{ CC = (l < c) ? 1 : 2; break; }} }} }}"
         ),
-        "STCM": f"{{ uint32_t a0 = {S}; for (int k = 0; k < 4; k++) if (({r3}u >> (3 - k)) & 1u) M[(a0 + k) & MASK24] = (uint8_t)(R[{r1}] >> (24 - 8 * k)); }}",
-        "ICM": (
-            f"{{ uint32_t a0 = {S}; uint32_t v = 0; uint8_t firstb = 0; int have = 0;"
+        # STCM stores selected bytes to successive locations (p. 141).
+        "STCM": (
+            f"{{ uint32_t a0 = {S}; int pos = 0;"
             f" for (int k = 0; k < 4; k++) if (({r3}u >> (3 - k)) & 1u)"
-            f" {{ uint8_t b = M[(a0 + k) & MASK24]; if (!have) {{ firstb = b; have = 1; }}"
-            f" v |= (uint32_t)b << (24 - 8 * k); }}"
+            f" {{ M[(a0 + pos) & MASK24] = (uint8_t)(R[{r1}] >> (24 - 8 * k)); pos++; }} }}"
+        ),
+        # ICM fetches contiguous bytes; unselected register bytes are unchanged.
+        "ICM": (
+            f"{{ uint32_t a0 = {S}; uint32_t v = R[{r1}]; uint8_t firstb = 0; int have = 0, pos = 0;"
+            f" for (int k = 0; k < 4; k++) if (({r3}u >> (3 - k)) & 1u)"
+            f" {{ uint8_t b = M[(a0 + pos) & MASK24]; pos++;"
+            f" if (!have) {{ firstb = b; have = 1; }}"
+            f" v = (v & ~(0xFFu << (24 - 8 * k))) | ((uint32_t)b << (24 - 8 * k)); }}"
             f" R[{r1}] = v;"
             f" CC = (!have || v == 0) ? 0 : ((firstb & 0x80u) ? 1 : 2); }}"
         ),
         "CS": (
-            f"{{ uint32_t a0 = {S}; uint32_t old = ld32(a0);"
+            f"{{ uint32_t a0 = {S}; if (a0 & 3u) unimplemented(0x{ins.address:06X}u, \"CS operand not word-aligned\");"
+            f" uint32_t old = ld32(a0);"
             f" if (old == R[{r1}]) {{ st32(a0, R[{r3}]); CC = 0; }} else {{ R[{r1}] = old; CC = 1; }} }}"
         ),
     }
 
     if name in fixed:
-        return [fixed[name], nxt]
+        return out + [fixed[name], nxt]
 
     if name in ("AR", "SR"):
         op = "+" if name == "AR" else "-"
-        return [
+        return out + [
             f"{{ int64_t t = (int64_t)(int32_t)R[{r1}] {op} (int64_t)(int32_t)R[{r2}];"
             f" R[{r1}] = (uint32_t)t;"
             f" if (t > 2147483647LL || t < -2147483648LL) CC = 3; else CC = cc_of(t); }}",
@@ -411,7 +514,7 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
 
     if name in ("A", "S"):
         op = "+" if name == "A" else "-"
-        return [
+        return out + [
             f"{{ int64_t t = (int64_t)(int32_t)R[{r1}] {op} (int64_t)(int32_t)ld32({A});"
             f" R[{r1}] = (uint32_t)t;"
             f" if (t > 2147483647LL || t < -2147483648LL) CC = 3; else CC = cc_of(t); }}",
@@ -420,7 +523,7 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
 
     if name in ("AH", "SH"):
         op = "+" if name == "AH" else "-"
-        return [
+        return out + [
             f"{{ int64_t t = (int64_t)(int32_t)R[{r1}] {op} (int64_t)(int16_t)ld16({A});"
             f" R[{r1}] = (uint32_t)t;"
             f" if (t > 2147483647LL || t < -2147483648LL) CC = 3; else CC = cc_of(t); }}",
@@ -429,139 +532,152 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
 
     if name in ("ALR", "AL"):
         other = f"R[{r2}]" if name == "ALR" else f"ld32({A})"
-        return [
+        return out + [
             f"{{ uint64_t s = (uint64_t)R[{r1}] + (uint64_t)({other}); R[{r1}] = (uint32_t)s;"
             f" unsigned carry = s > 0xFFFFFFFFull; CC = (carry ? 2 : 0) | (R[{r1}] ? 1 : 0); }}",
             nxt,
         ]
 
+    # SUBTRACT LOGICAL: carry out of the sign position (a >= b); CC 0 is
+    # unreachable (GA22-7000-4, p. 144).
     if name in ("SLR", "SL"):
         other = f"R[{r2}]" if name == "SLR" else f"ld32({A})"
-        return [
+        return out + [
             f"{{ uint32_t a0 = R[{r1}], s0 = {other}; uint32_t r = a0 - s0; R[{r1}] = r;"
-            f" unsigned borrow = s0 > a0; CC = (borrow ? 2 : 0) | (r ? 1 : 0); }}",
+            f" unsigned carry = a0 >= s0; CC = (carry ? 2 : 0) | (r ? 1 : 0); }}",
             nxt,
         ]
 
+    # MULTIPLY: the multiplicand is the ODD register of the pair (p. 136).
     if name in ("MR", "M"):
         if r1 % 2 or r1 == 15:
-            return [f'unimplemented(0x{ins.address:06X}u, "odd first operand");']
+            return out + [f'unimplemented(0x{ins.address:06X}u, "odd first operand");']
         src = f"(int32_t)R[{r2}]" if name == "MR" else f"(int32_t)ld32({A})"
-        return [
-            f"{{ int64_t p = (int64_t)(int32_t)R[{r1}] * (int64_t)({src});"
+        return out + [
+            f"{{ int64_t p = (int64_t)(int32_t)R[{r1 + 1}] * (int64_t)({src});"
             f" R[{r1}] = (uint32_t)((uint64_t)p >> 32); R[{r1 + 1}] = (uint32_t)p; }}",
             nxt,
         ]
 
+    # DIVIDE: remainder into the even register, quotient into the odd (p. 128).
     if name in ("DR", "D"):
         if r1 % 2 or r1 == 15:
-            return [f'unimplemented(0x{ins.address:06X}u, "odd first operand");']
+            return out + [f'unimplemented(0x{ins.address:06X}u, "odd first operand");']
         src = f"(int32_t)R[{r2}]" if name == "DR" else f"(int32_t)ld32({A})"
-        return [
+        return out + [
             f"{{ int32_t dvs = {src}; if (!dvs) unimplemented(0x{ins.address:06X}u, \"divide by zero\");"
             f" int64_t dvd = (int64_t)(((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}]);"
             f" int64_t q = dvd / dvs, rem = dvd % dvs;"
             f" if (q > 2147483647LL || q < -2147483648LL) unimplemented(0x{ins.address:06X}u, \"divide overflow\");"
-            f" R[{r1}] = (uint32_t)q; R[{r1 + 1}] = (uint32_t)rem; }}",
+            f" R[{r1}] = (uint32_t)rem; R[{r1 + 1}] = (uint32_t)q; }}",
             nxt,
         ]
 
     if name == "MH":
-        return [
+        return out + [
             f"{{ int64_t p = (int64_t)(int32_t)R[{r1}] * (int64_t)(int16_t)ld16({A});"
             f" R[{r1}] = (uint32_t)p; }}",
             nxt,
         ]
 
+    # ---- branches ----
+    # A base-addressed target is only used when the base register still holds
+    # the value learned statically; otherwise the address is computed at run
+    # time and dispatched. That keeps two routines sharing a base register
+    # correct, which a single global mapping would not.
+    def goto_target(fallback: str, condition: str | None, unconditional_target=None) -> list[str]:
+        if ins.b2 == 0:
+            target = (ins.d2 & 0xFFFFFF) if unconditional_target is None else unconditional_target
+            if target in known:
+                inner = [f"goto L_{target:06X};"]
+            else:
+                # Target never decoded: hand the address to the dispatcher.
+                inner = [f"IA = {fallback}; goto dispatch;"]
+        else:
+            inner = [f"if (R[{ins.b2}] == 0x{value:06X}u) goto L_{(value + ins.d2) & 0xFFFFFF:06X};"
+                     for value in sorted(bases.get(ins.b2, ()))
+                     if (value + ins.d2) & 0xFFFFFF in known]
+            inner.append(f"IA = {fallback}; goto dispatch;")
+        if condition is None:
+            return inner
+        return [f"if ({condition}) {{"] + [f"  {line}" for line in inner] + ["}"]
+
     if name == "BC":
-        target = _branch_target(ins, bases)
         if r1 == 15:
-            return [f"goto L_{target:06X};"] if target is not None else [f"IA = {A}; goto dispatch;"]
-        take = f"((0x{r1:X}u >> (3 - CC)) & 1u)"
-        if target is not None:
-            return [f"if ({take}) goto L_{target:06X};", nxt]
-        return [f"if ({take}) {{ IA = {A}; goto dispatch; }}", nxt]
+            return out + goto_target(A, None)
+        return out + goto_target(A, f"((0x{r1:X}u >> (3 - CC)) & 1u)") + [nxt]
 
     if name == "BAL":
-        target = _branch_target(ins, bases)
-        out = []
+        lines = []
         if r1:
-            out.append(f"R[{r1}] = 0x{(ins.address + ins.length) & 0xFFFFFF:06X}u;")
-        out.append(f"goto L_{target:06X};" if target is not None else f"IA = {A}; goto dispatch;")
-        return out
+            lines.append(f"R[{r1}] = {link_word(2)};")
+        lines.extend(goto_target(A, None))
+        return out + lines
 
     if name == "BCT":
-        target = _branch_target(ins, bases)
-        out = [f"R[{r1}] = R[{r1}] - 1u;"]
-        if target is not None:
-            out.append(f"if (R[{r1}]) goto L_{target:06X};")
-        else:
-            out.append(f"if (R[{r1}]) {{ IA = {A}; goto dispatch; }}")
-        out.append(nxt)
-        return out
+        # The branch address is computed before the decrement (p. 122).
+        lines = [f"{{ uint32_t tgt = {A}; R[{r1}] = R[{r1}] - 1u;",
+                 f"  if (R[{r1}]) {{ IA = tgt; goto dispatch; }} }}"]
+        lines.append(nxt)
+        return out + lines
 
     if name == "BCR":
         if r2 == 0:
-            return [nxt]
-        return [
+            return out + [nxt]
+        return out + [
             f"if (((0x{r1:X}u) >> (3 - CC)) & 1u) {{ IA = R[{r2}] & MASK24; goto dispatch; }}",
             nxt,
         ]
 
     if name == "BALR":
-        out = []
+        lines = []
         if r1:
-            out.append(f"R[{r1}] = 0x{(ins.address + ins.length) & 0xFFFFFF:06X}u;")
+            lines.append(f"R[{r1}] = {link_word(1)};")
         if r2:
-            out.append(f"IA = R[{r2}] & MASK24; goto dispatch;")
+            lines.append(f"IA = R[{r2}] & MASK24; goto dispatch;")
         else:
-            out.append(nxt)
-        return out
+            lines.append(nxt)
+        return out + lines
 
     if name == "BCTR":
         if r2 == 0:
-            return [f"R[{r1}] = R[{r1}] - 1u;", nxt]
-        return [
-            f"R[{r1}] = R[{r1}] - 1u;",
-            f"if (R[{r1}]) {{ IA = R[{r2}] & MASK24; goto dispatch; }}",
+            return out + [f"R[{r1}] = R[{r1}] - 1u;", nxt]
+        return out + [
+            f"{{ uint32_t tgt = R[{r2}] & MASK24; R[{r1}] = R[{r1}] - 1u;"
+            f" if (R[{r1}]) {{ IA = tgt; goto dispatch; }} }}",
             nxt,
         ]
 
     if name in ("BXH", "BXLE"):
         cr = r3 if r3 % 2 else (r3 + 1) % 16
         comparand = f"R[{r1}]" if cr == r1 else f"R[{cr}]"
-        target = _branch_target(ins, bases)
         cmp = ">" if name == "BXH" else "<="
-        out = [
-            f"{{ int32_t cmp = (int32_t){comparand};"
-            f" R[{r1}] = R[{r1}] + R[{r3}];"
-        ]
-        if target is not None:
-            out.append(f"  if ((int32_t)R[{r1}] {cmp} cmp) goto L_{target:06X}; }}")
-        else:
-            out.append(f"  if ((int32_t)R[{r1}] {cmp} cmp) {{ IA = {S}; goto dispatch; }} }}")
-        out.append(nxt)
-        return out
+        inner = goto_target(S, None)
+        body = [f"{{ int32_t cmp = (int32_t){comparand};",
+                f"  R[{r1}] = R[{r1}] + R[{r3}];",
+                f"  if ((int32_t)R[{r1}] {cmp} cmp) {{"]
+        body += [f"    {line}" for line in inner]
+        body += ["  } }", nxt]
+        return out + body
 
     if name in ("STM", "LM"):
-        first = r1
-        last = r3
-        op = "st32" if name == "STM" else "ld32"
-        assign = (
-            f"st32(base, R[r]);" if name == "STM" else f"R[r] = ld32(base);"
-        )
-        return [
-            f"{{ uint32_t base = {S}; unsigned r = {first}u;"
-            f" for (;;) {{ {assign} base = (base + 4u) & MASK24;"
-            f" if (r == {last}u) break; r = (r + 1u) & 15u; }} }}",
-            nxt,
-        ]
+        count = ((r3 - r1) % 16) + 1
+        if name == "STM":
+            store(S, f"{count * 4}u")
+            body = (f"{{ uint32_t base = {S}; unsigned r = {r1}u;"
+                    f" for (int n = 0; n < {count}; n++) {{ st32(base, R[r]);"
+                    f" base = (base + 4u) & MASK24; r = (r + 1u) & 15u; }} }}")
+        else:
+            body = (f"{{ uint32_t base = {S}; unsigned r = {r1}u;"
+                    f" for (int n = 0; n < {count}; n++) {{ R[r] = ld32(base);"
+                    f" base = (base + 4u) & MASK24; r = (r + 1u) & 15u; }} }}")
+        return out + [body, nxt]
 
-    if name == "SLDL" or name == "SRDL":
+    if name in ("SLDL", "SRDL"):
         if r1 % 2:
-            return [f'unimplemented(0x{ins.address:06X}u, "odd double shift");']
+            return out + [f'unimplemented(0x{ins.address:06X}u, "odd double shift");']
         op = "<<" if name == "SLDL" else ">>"
-        return [
+        return out + [
             f"{{ unsigned n = (unsigned){SH}; uint64_t x = ((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}];"
             f" if (n >= 64u) x = 0u; else x = x {op} n;"
             f" R[{r1}] = (uint32_t)(x >> 32); R[{r1 + 1}] = (uint32_t)x; }}",
@@ -570,19 +686,22 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
 
     if name in ("SLDA", "SRDA"):
         if r1 % 2:
-            return [f'unimplemented(0x{ins.address:06X}u, "odd double shift");']
+            return out + [f'unimplemented(0x{ins.address:06X}u, "odd double shift");']
         if name == "SLDA":
-            return [
+            return out + [
                 f"{{ unsigned n = (unsigned){SH};"
-                f" int64_t x = (int64_t)(((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}]);"
-                f" int64_t y;"
-                f" if (n >= 64u) y = 0; else y = (int64_t)((uint64_t)x << n);"
-                f" R[{r1}] = (uint32_t)(((uint64_t)y) >> 32); R[{r1 + 1}] = (uint32_t)y;"
-                f" CC = (y == 0) ? 0 : ((y < 0) ? 1 : 2);"
-                f" if (n && n < 64u && ((y >> n) != x)) CC = 3; }}",
+                f" uint64_t v = ((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}];"
+                f" uint64_t sign = v & 0x8000000000000000ull; uint64_t mag = v & 0x7FFFFFFFFFFFFFFFull;"
+                f" int ovf = 0;"
+                f" if (n) {{ uint64_t lost = (n < 63u) ? (mag >> (63u - n)) : mag;"
+                f" uint64_t expected = sign ? ((n < 63u) ? ((1ull << n) - 1ull) : 0x7FFFFFFFFFFFFFFFull) : 0ull;"
+                f" ovf = (lost != expected); }}"
+                f" uint64_t r = sign | ((mag << n) & 0x7FFFFFFFFFFFFFFFull);"
+                f" R[{r1}] = (uint32_t)(r >> 32); R[{r1 + 1}] = (uint32_t)r;"
+                f" CC = ovf ? 3 : ((r == 0) ? 0 : ((r & 0x8000000000000000ull) ? 1 : 2)); }}",
                 nxt,
             ]
-        return [
+        return out + [
             f"{{ unsigned n = (unsigned){SH};"
             f" int64_t x = (int64_t)(((uint64_t)R[{r1}] << 32) | (uint64_t)R[{r1 + 1}]);"
             f" int64_t y = (n >= 64u) ? (x < 0 ? -1 : 0) : (x >> n);"
@@ -592,7 +711,7 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name == "CVD":
-        return [
+        return out + [
             f"{{ int64_t v = (int32_t)R[{r1}]; uint32_t a0 = {A}; unsigned neg = v < 0;"
             f" uint64_t mag = neg ? (uint64_t)(-v) : (uint64_t)v; uint8_t dg[16];"
             f" for (int k = 14; k >= 0; k--) {{ dg[k] = (uint8_t)(mag % 10); mag /= 10; }}"
@@ -601,23 +720,25 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
             nxt,
         ]
 
+    # CVB: out of range loads the low 32 bits and raises a FIXED-POINT DIVIDE
+    # exception (p. 128), not an overflow.
     if name == "CVB":
-        return [
-            f"{{ uint32_t a0 = {A}; int64_t v = 0; uint8_t sign;"
+        return out + [
+            f"{{ uint32_t a0 = {A}; int64_t v = 0; uint8_t sign = 0;"
             f" for (int k = 0; k < 8; k++) {{ uint8_t b = M[(a0 + k) & MASK24];"
-            f" uint8_t hi = b >> 4, lo = b & 0x0F; if (hi > 9) unimplemented(0x{ins.address:06X}u, \"bad packed digit\");"
+            f" uint8_t hi = b >> 4, lo = b & 0x0F; if (hi > 9 || (k < 7 && lo > 9))"
+            f" unimplemented(0x{ins.address:06X}u, \"bad packed digit\");"
             f" if (k == 7) {{ v = v * 10 + hi; sign = lo; }} else v = v * 100 + hi * 10 + lo; }}"
             f" if (sign == 0xB || sign == 0xD) v = -v;"
-            f" if (v > 2147483647LL || v < -2147483648LL) unimplemented(0x{ins.address:06X}u, \"CVB overflow\");"
-            f" R[{r1}] = (uint32_t)v; }}",
+            f" R[{r1}] = (uint32_t)v;"
+            f" if (v > 2147483647LL || v < -2147483648LL)"
+            f" unimplemented(0x{ins.address:06X}u, \"CVB out of range (fixed-point divide)\"); }}",
             nxt,
         ]
 
     if name == "PACK":
-        # Right-aligned: low-order digits are kept, high-order positions are
-        # zero-filled, and any surplus high-order digits are discarded.
-        return [
-            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L + 1}, nd = {L + 1}; int cap = 2 * nd - 1;"
+        return out + [
+            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L2 + 1}, nd = {L1 + 1}; int cap = 2 * nd - 1;"
             f" uint8_t seq[600], nib[600]; int n = 0;"
             f" for (int k = ns - 1; k >= 0; k--) seq[n++] = (uint8_t)(M[(s0 + k) & MASK24] & 0x0F);"
             f" uint8_t sign = (uint8_t)(M[(s0 + ns - 1) & MASK24] >> 4);"
@@ -631,10 +752,8 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name == "UNPK":
-        # nib[0] is the most significant nibble, so digits keep their order;
-        # the sign replaces the zone of the low-order byte.
-        return [
-            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L + 1}, nd = {L + 1}; int cap = 2 * nd - 1;"
+        return out + [
+            f"{{ uint32_t d0 = {D1}, s0 = {D2}; int ns = {L2 + 1}, nd = {L1 + 1}; int cap = 2 * nd - 1;"
             f" uint8_t nib[600]; int n = 0;"
             f" for (int k = 0; k < ns; k++) {{ uint8_t b = M[(s0 + k) & MASK24];"
             f" nib[n++] = (uint8_t)(b >> 4); nib[n++] = (uint8_t)(b & 0x0F); }}"
@@ -648,9 +767,41 @@ def emit(ins: Instruction, bases: dict[int, int] | None = None) -> list[str]:
         ]
 
     if name == "DIAG":
-        return ["goto done;"]
+        return out + ["goto done;"]
 
     if name == "SVC":
-        return [f'unimplemented(0x{ins.address:06X}u, "SVC");']
+        return out + [f'unimplemented(0x{ins.address:06X}u, "SVC is not translated");']
 
-    return [f'unimplemented(0x{ins.address:06X}u, "{name}");']
+    # Instructions the interpreter implements but the translator does not.
+    if name in ("EX", "MVCL", "CLCL", "CDS", "SSM", "LPSW", "LRA"):
+        return out + [f'unimplemented(0x{ins.address:06X}u, "{name} is not translated");']
+
+    return out + [f'unimplemented(0x{ins.address:06X}u, "{name}");']
+
+
+def _goto_target(ins: Instruction, bases: dict[int, set[int]], fallback: str,
+                 unconditional: bool, prefix: str = "", suffix: str = "") -> list[str]:
+    """Emit a branch, guarding any base-register resolution at run time.
+
+    A base value learned statically is only used when the register still holds
+    it, so two routines that establish the same base register are both correct.
+    """
+    lines: list[str] = []
+    if ins.b2 == 0:
+        target = ins.d2 & 0xFFFFFF
+        lines.append(f"{prefix}goto L_{target:06X};{suffix}")
+        return lines
+    for value in sorted(bases.get(ins.b2, ())):
+        target = (value + ins.d2) & 0xFFFFFF
+        lines.append(f"{prefix}if (R[{ins.b2}] == 0x{value:06X}u) goto L_{target:06X};{suffix}")
+    lines.append(f"{prefix}{{ IA = {fallback}; goto dispatch; }}{suffix}")
+    return lines
+
+
+def _branch(ins: Instruction, bases: dict[int, set[int]], nxt: str, fallback: str,
+            mask: int, unconditional: bool) -> list[str]:
+    if unconditional:
+        return _goto_target(ins, bases, fallback, unconditional=True)
+    take = f"((0x{mask:X}u >> (3 - CC)) & 1u)"
+    return _goto_target(ins, bases, fallback, unconditional=False,
+                        prefix=f"if ({take}) {{ ", suffix=" }")

@@ -33,8 +33,9 @@ NEXT    DS    F
         END
         """
     )
-    # 2 (BALR) + 2 (LR) + 6 (MVC) + 4 (DIAG)
-    assert result["symbols"]["NEXT"] == 0x1000 + 14
+    # 2 (BALR) + 2 (LR) + 6 (MVC) + 4 (DIAG) = 14, then NEXT DS F is aligned
+    # to a fullword boundary.
+    assert result["symbols"]["NEXT"] == 0x1010
 
 
 def test_using_turns_labels_into_displacements():
@@ -50,10 +51,11 @@ TARGET  DC    F'7'
         """
     )
     # R12 holds 0x2002 (after the two-byte BALR). TARGET follows BALR+L+DIAG
-    # = 2+4+4 bytes, so it is at 0x200A and the displacement is 8.
-    assert result["symbols"]["TARGET"] == 0x200A
+    # = 10 bytes and is then aligned to a fullword, so it is at 0x200C and the
+    # displacement from R12 is 10.
+    assert result["symbols"]["TARGET"] == 0x200C
     ins = result["image"][2:6]
-    assert ins == bytes.fromhex("5810C008")
+    assert ins == bytes.fromhex("5810C00A")
 
 
 def test_constant_types():
@@ -70,15 +72,48 @@ def test_constant_types():
         END
         """
     )
+    # Constants are aligned to their natural boundaries, so A(...) is padded
+    # to the next fullword after the single-byte binary constant.
     assert result["image"] == (
-        bytes.fromhex("00000001")
-        + bytes.fromhex("0002")
-        + "AB".encode("cp037")  # S/370 stores characters as EBCDIC
-        + bytes.fromhex("0D0A")
-        + bytes.fromhex("0A")
-        + bytes.fromhex("00001234")
-        + b"\xff\xff\xff"
+        bytes.fromhex("00000001")          # F'1'   at 0x1000
+        + bytes.fromhex("0002")            # H'2'   at 0x1004
+        + "AB".encode("cp037")             # C'AB'  at 0x1006 (EBCDIC)
+        + bytes.fromhex("0D0A")            # X'..'  at 0x1008
+        + bytes.fromhex("0A")              # B'..'  at 0x100A
+        + bytes.fromhex("00")              # pad to a fullword
+        + bytes.fromhex("00001234")        # A(...) at 0x100C
+        + b"\xff\xff\xff"                 # 3X'FF'
     )
+
+
+def test_constants_are_aligned():
+    result = assemble(
+        """
+        ORG   0x1001
+        DC    X'00'
+        DC    H'1'
+        DC    X'00'
+        DC    F'2'
+        END
+        """
+    )
+    # 0x1001 byte, then a halfword aligned to 0x1002, byte at 0x1004,
+    # then a fullword aligned to 0x1008.
+    assert result["image"] == bytes.fromhex("0000010000000000000002")
+
+
+def test_ds_zero_aligns_without_reserving():
+    result = assemble(
+        """
+        ORG   0x1001
+        DC    X'00'
+        DS    0F
+HERE    DC    X'FF'
+        END
+        """
+    )
+    assert result["symbols"]["HERE"] == 0x1004
+    assert result["image"] == bytes.fromhex("000000FF")
 
 
 def test_ds_reserves_without_emitting():

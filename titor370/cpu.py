@@ -338,8 +338,13 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_LNR(self, i: Instruction) -> None:
-        self.r[i.r1] = u32(-s32(self.r[i.r2]))
-        self.cc = cc_for(self.r[i.r1])
+        """LOAD NEGATIVE: "The two's complement of the absolute value of the
+        second operand is placed in the first-operand location. The operation
+        complements positive numbers; negative numbers remain unchanged"
+        (GA22-7000-4, p. 132). CC: 0 zero, 1 less than zero."""
+        value = s32(self.r[i.r2])
+        self.r[i.r1] = u32(-abs(value))
+        self.cc = 0 if self.r[i.r1] == 0 else 1
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_LPR(self, i: Instruction) -> None:
@@ -388,12 +393,22 @@ class CPU:
         self._logical_add_cc(s, s > MASK32)
         self.psw.ia = wrap24(i.address + i.length)
 
+    def _subtract_logical_cc(self, a: int, b: int, result: int) -> None:
+        """SUBTRACT LOGICAL condition code (GA22-7000-4, p. 144).
+
+        The carry out of the sign position is recorded: 1 + (carry ? 2 : 0)
+        plus 1 if the difference is nonzero. "A zero difference cannot be
+        obtained without a carry out of the sign position", so CC 0 never
+        occurs.
+        """
+        carry = a >= b            # carry out of the sign position
+        self.cc = (2 if carry else 0) | (1 if result & MASK32 else 0)
+
     def op_SLR(self, i: Instruction) -> None:
         a, b = self.r[i.r1] & MASK32, self.r[i.r2] & MASK32
-        s = a - b
-        self.r[i.r1] = s & MASK32
-        # SUBTRACT LOGICAL: carry means a borrow occurred (second operand larger)
-        self._logical_add_cc(s, b > a)
+        result = (a - b) & MASK32
+        self.r[i.r1] = result
+        self._subtract_logical_cc(a, b, result)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_NR(self, i: Instruction) -> None:
@@ -424,7 +439,10 @@ class CPU:
     def op_MR(self, i: Instruction) -> None:
         if i.r1 % 2:
             raise SpecificationException("MR odd first operand", i.address)
-        product = s32(self.r[i.r1]) * s32(self.r[i.r2])
+        # "The multiplicand is taken from the odd register of the pair. The
+        # contents of the even-numbered register replaced by the product are
+        # ignored" (GA22-7000-4, p. 136).
+        product = s32(self.r[i.r1 + 1]) * s32(self.r[i.r2])
         self.r[i.r1] = (product >> 32) & MASK32
         self.r[i.r1 + 1] = product & MASK32
         self.psw.ia = wrap24(i.address + i.length)
@@ -440,23 +458,37 @@ class CPU:
         quotient, remainder = _trunc_divmod(dividend, divisor)
         if not (-2**31 <= quotient < 2**31):
             raise FixedPointDivide("quotient overflow", i.address)
-        self.r[i.r1] = quotient & MASK32
-        self.r[i.r1 + 1] = remainder & MASK32
+        # "A 32-bit signed remainder and a 32-bit signed quotient replace the
+        # dividend in the even-numbered and odd-numbered registers,
+        # respectively" (GA22-7000-4, p. 128).
+        self.r[i.r1] = remainder & MASK32
+        self.r[i.r1 + 1] = quotient & MASK32
         self.psw.ia = wrap24(i.address + i.length)
+
+    def _link_word(self, i: Instruction) -> int:
+        """Link information: ILC | CC | program mask | instruction address
+        (GA22-7000-4, p. 121). ILC is 1 for a two-byte instruction and 2 for
+        a four-byte one."""
+        ilc = 1 if i.length == 2 else 2
+        return ((ilc << 30) | ((self.cc & 0x3) << 28)
+                | ((self.psw.pmask & 0xF) << 24)
+                | ((i.address + i.length) & MASK24))
 
     def op_BALR(self, i: Instruction) -> None:
         target = self.r[i.r2] & MASK24
         if i.r1:
-            self.r[i.r1] = (i.address + i.length) & MASK32
+            self.r[i.r1] = self._link_word(i)
         if i.r2:
             self.psw.ia = target
         else:
             self.psw.ia = wrap24(i.address + i.length)
 
     def op_BCTR(self, i: Instruction) -> None:
+        # "The branch address is computed before the counting operation."
+        target = self.r[i.r2] & MASK24
         self.r[i.r1] = (self.r[i.r1] - 1) & MASK32
         if self.r[i.r1] != 0 and i.r2:
-            self.psw.ia = self.r[i.r2] & MASK24
+            self.psw.ia = target
         else:
             self.psw.ia = wrap24(i.address + i.length)
 
@@ -474,49 +506,77 @@ class CPU:
         raise SupervisorCall(i.raw[1], i.address)
 
     def op_MVCL(self, i: Instruction) -> None:
-        """MOVE LONG: R1 = destination, R2 = source; R0 low byte is the pad.
+        """MOVE LONG.
 
-        Condition code: 0 lengths equal, 1 first-operand length low, 2 high,
-        3 overlap with identical address and length (no operation).
+        R1 and R2 each designate an even-odd pair. The leftmost byte of each
+        operand is addressed by bits 8-31 of R1/R2; the counts are in bits 8-31
+        of R1+1/R2+1; the padding character is in bits 0-7 of R2+1
+        (GA22-7000-4, p. 133).
         """
-        d = self.r[i.r1]
-        src = self.r[i.r2]
-        daddr, dlen = d & MASK24, (d >> 24) & 0xFF
-        saddr, slen = src & MASK24, (src >> 24) & 0xFF
-        pad = self.r[0] & 0xFF
+        if i.r1 % 2 or i.r2 % 2:
+            raise SpecificationException("MVCL odd register", i.address)
+        d, src = self.r[i.r1], self.r[i.r2]
+        daddr, saddr = d & MASK24, src & MASK24
+        dlen = self.r[i.r1 + 1] & MASK24
+        slen = self.r[i.r2 + 1] & MASK24
+        pad = (self.r[i.r2 + 1] >> 24) & 0xFF
 
-        if daddr == saddr and dlen == slen:
+        n = min(dlen, slen)
+        # "No movement performed because of destructive overlap": the first
+        # operand starts to the right of the second but inside its field.
+        if n and daddr > saddr and daddr < saddr + n:
             self.cc = 3
             self.psw.ia = wrap24(i.address + i.length)
             return
 
-        n = min(dlen, slen)
         if n:
             chunk = bytes(self.memory[saddr : saddr + n])
             self.memory[daddr : daddr + n] = chunk
         if slen < dlen:
-            fill = dlen - slen
-            self.memory[daddr + slen : daddr + slen + fill] = bytes([pad]) * fill
+            self.memory[daddr + slen : daddr + dlen] = bytes([pad]) * (dlen - slen)
 
         self.cc = 0 if dlen == slen else (1 if dlen < slen else 2)
-        self.r[i.r1] = (((dlen - n) & 0xFF) << 24) | ((daddr + n) & MASK24)
-        self.r[i.r2] = (((slen - n) & 0xFF) << 24) | ((saddr + n) & MASK24)
+        # "The high-order byte of registers R1 and R2 is set to zero; the
+        # contents of the high-order byte of registers R1+1 and R2+1 remain
+        # unchanged" (p. 134).
+        self.r[i.r1] = (daddr + n) & MASK24
+        self.r[i.r2] = (saddr + n) & MASK24
+        self.r[i.r1 + 1] = (self.r[i.r1 + 1] & 0xFF000000) | ((dlen - n) & MASK24)
+        self.r[i.r2 + 1] = (self.r[i.r2 + 1] & 0xFF000000) | ((slen - n) & MASK24)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_CLCL(self, i: Instruction) -> None:
-        a = self.r[i.r1]
-        b = self.r[i.r2]
-        aaddr, alen = a & MASK24, (a >> 24) & 0xFF
-        baddr, blen = b & MASK24, (b >> 24) & 0xFF
+        """COMPARE LOGICAL LONG: same register layout as MVCL, and "the shorter
+        operand is considered extended with the padding character" (p. 126)."""
+        if i.r1 % 2 or i.r2 % 2:
+            raise SpecificationException("CLCL odd register", i.address)
+        a, b = self.r[i.r1] & MASK24, self.r[i.r2] & MASK24
+        alen = self.r[i.r1 + 1] & MASK24
+        blen = self.r[i.r2 + 1] & MASK24
+        pad = (self.r[i.r2 + 1] >> 24) & 0xFF
+
         n = min(alen, blen)
-        left = bytes(self.memory[aaddr : aaddr + n])
-        right = bytes(self.memory[baddr : baddr + n])
-        if left < right:
-            self.cc = 1
-        elif left > right:
-            self.cc = 2
-        else:
-            self.cc = 0 if alen == blen else (1 if alen < blen else 2)
+        left = bytes(self.memory[a : a + n])
+        right = bytes(self.memory[b : b + n])
+        self.cc = 0
+        for x, y in zip(left, right):
+            if x != y:
+                self.cc = 1 if x < y else 2
+                break
+        if self.cc == 0 and alen != blen:
+            # The shorter operand is padded; compare the pad against the rest.
+            longer_from, longer_len = (b, blen) if alen < blen else (a, alen)
+            for k in range(n, longer_len):
+                byte = self.memory[longer_from + k]
+                if byte != pad:
+                    first_is_low = (byte > pad) if alen < blen else (byte < pad)
+                    self.cc = 1 if first_is_low else 2
+                    break
+
+        self.r[i.r1] = (a + n) & MASK24
+        self.r[i.r2] = (b + n) & MASK24
+        self.r[i.r1 + 1] = (self.r[i.r1 + 1] & 0xFF000000) | ((alen - n) & MASK24)
+        self.r[i.r2 + 1] = (self.r[i.r2 + 1] & 0xFF000000) | ((blen - n) & MASK24)
         self.psw.ia = wrap24(i.address + i.length)
 
     # ---------------- RX ----------------
@@ -571,9 +631,9 @@ class CPU:
     def op_SL(self, i: Instruction) -> None:
         b = self.fetch_u32(self._rx_addr(i), i.address)
         a = self.r[i.r1] & MASK32
-        s = a - b
-        self.r[i.r1] = s & MASK32
-        self._logical_add_cc(s, b > a)
+        result = (a - b) & MASK32
+        self.r[i.r1] = result
+        self._subtract_logical_cc(a, b, result)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_N(self, i: Instruction) -> None:
@@ -606,7 +666,7 @@ class CPU:
     def op_M(self, i: Instruction) -> None:
         if i.r1 % 2:
             raise SpecificationException("M odd first operand", i.address)
-        product = s32(self.r[i.r1]) * s32(self.fetch_u32(self._rx_addr(i), i.address))
+        product = s32(self.r[i.r1 + 1]) * s32(self.fetch_u32(self._rx_addr(i), i.address))
         self.r[i.r1] = (product >> 32) & MASK32
         self.r[i.r1 + 1] = product & MASK32
         self.psw.ia = wrap24(i.address + i.length)
@@ -621,8 +681,9 @@ class CPU:
         quotient, remainder = _trunc_divmod(dividend, divisor)
         if not (-2**31 <= quotient < 2**31):
             raise FixedPointDivide("quotient overflow", i.address)
-        self.r[i.r1] = quotient & MASK32
-        self.r[i.r1 + 1] = remainder & MASK32
+        # Remainder to the even register, quotient to the odd (p. 128).
+        self.r[i.r1] = remainder & MASK32
+        self.r[i.r1 + 1] = quotient & MASK32
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_AH(self, i: Instruction) -> None:
@@ -677,9 +738,12 @@ class CPU:
         value = int("".join(str(d) for d in digits))
         if sign_nibble in (0xB, 0xD):
             value = -value
-        if not (-2**31 <= value < 2**31):
-            raise FixedPointOverflow("CVB value out of range", i.address)
+        # "For any decimal number outside this range, the operation is
+        # completed by placing the 32 low-order binary bits in the register; a
+        # fixed-point divide exception exists" (GA22-7000-4, p. 128).
         self.r[i.r1] = value & MASK32
+        if not (-2**31 <= value < 2**31):
+            raise FixedPointDivide("CVB value out of range", i.address)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_BC(self, i: Instruction) -> None:
@@ -692,27 +756,37 @@ class CPU:
     def op_BAL(self, i: Instruction) -> None:
         target = self._rx_addr(i)
         if i.r1:
-            self.r[i.r1] = (i.address + i.length) & MASK32
+            self.r[i.r1] = self._link_word(i)
         self.psw.ia = target
 
     def op_BCT(self, i: Instruction) -> None:
+        # The address is computed from the register *before* it is decremented,
+        # which matters when R1 is also the base or index register.
+        target = self._rx_addr(i)
         self.r[i.r1] = (self.r[i.r1] - 1) & MASK32
         if self.r[i.r1] != 0:
-            self.psw.ia = self._rx_addr(i)
+            self.psw.ia = target
         else:
             self.psw.ia = wrap24(i.address + i.length)
 
     def op_EX(self, i: Instruction) -> None:
         subject_addr = self._rx_addr(i)
+        if subject_addr % 2:
+            raise SpecificationException("EX effective address is odd", i.address)
         try:
             subject = decode(self.memory, subject_addr)
         except ValueError as exc:
             raise OperationException(str(exc), i.address) from None
-        if subject.length < 2:
-            raise SpecificationException("EX of a one-byte subject", i.address)
-        # OR the low byte of R1 into the second byte of the subject instruction
+        if subject.name == "EX":
+            # "When the subject instruction is in turn an EXECUTE, an execute
+            # exception is recognized, and the operation is suppressed."
+            raise ProgramCheck(0x03, "EX of EX", i.address)
+        # "Bits 8-15 of the instruction ... are ORed with bits 24-31 of the
+        # register specified by R1, except when register 0 is specified, which
+        # indicates that no modification takes place" (p. 129).
         patched = bytearray(subject.raw)
-        patched[1] |= self.r[i.r1] & 0xFF
+        if i.r1:
+            patched[1] |= self.r[i.r1] & 0xFF
         saved = bytes(self.memory[subject_addr : subject_addr + len(patched)])
         self.memory[subject_addr : subject_addr + len(patched)] = patched
         try:
@@ -726,8 +800,8 @@ class CPU:
             self.memory[subject_addr : subject_addr + len(patched)] = saved
 
     def op_LRA(self, i: Instruction) -> None:
-        self.r[i.r1] = self._rx_addr(i)
-        self.psw.ia = wrap24(i.address + i.length)
+        # LOAD REAL ADDRESS is a privileged instruction.
+        raise PrivilegedOperation("LRA", i.address)
 
     # ---------------- RS ----------------
 
@@ -760,16 +834,25 @@ class CPU:
         self.cc = 0 if v == 0 else (1 if v < 0 else 2)
 
     def op_SLA(self, i: Instruction) -> None:
+        """Shift Left Single arithmetic.
+
+        "The sign of the first operand remains unchanged. All 31 integer bits
+        of the operand participate in the left shift... If a bit unlike the
+        sign bit is shifted out of position 1, an overflow occurs."
+        (GA22-7000-4, p. 139)
+        """
         n = self._shift_amount(i)
-        before = s32(self.r[i.r1])
-        result = (before << n) & MASK32
+        before = self.r[i.r1] & MASK32
+        sign = before & 0x80000000
+        magnitude = before & 0x7FFFFFFF
+        overflow = False
+        if n:
+            lost = magnitude >> (31 - n) if n < 31 else magnitude
+            expected = 0 if not sign else (1 << n) - 1 if n < 31 else 0x7FFFFFFF
+            overflow = lost != expected
+        result = sign | ((magnitude << n) & 0x7FFFFFFF)
         self.r[i.r1] = result
-        self._shift_arith_cc(result, before)
-        # Overflow when a bit shifted out of the sign position differs from the
-        # new sign: equivalently, when an arithmetic right shift by the same
-        # amount does not restore the original value.
-        if n and (s32(result) >> n) != before:
-            self.cc = 3
+        self.cc = 3 if overflow else (0 if result == 0 else (1 if result & 0x80000000 else 2))
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_SRA(self, i: Instruction) -> None:
@@ -799,15 +882,21 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_SLDA(self, i: Instruction) -> None:
+        """Shift Left Double arithmetic: the sign of the even register is
+        preserved; the 63 integer bits shift left."""
         n = self._shift_amount(i)
-        before = s64(self._double(i))
-        result = (before << n) & 0xFFFF_FFFF_FFFF_FFFF
+        before = self._double(i)
+        sign = before & 0x8000_0000_0000_0000
+        magnitude = before & 0x7FFF_FFFF_FFFF_FFFF
+        overflow = False
+        if n:
+            lost = magnitude >> (63 - n) if n < 63 else magnitude
+            expected = 0 if not sign else (1 << n) - 1 if n < 63 else 0x7FFF_FFFF_FFFF_FFFF
+            overflow = lost != expected
+        result = sign | ((magnitude << n) & 0x7FFF_FFFF_FFFF_FFFF)
         self.r[i.r1] = (result >> 32) & MASK32
         self.r[i.r1 + 1] = result & MASK32
-        v = s64(result)
-        self.cc = 0 if v == 0 else (1 if v < 0 else 2)
-        if n and (s64(result) >> n) != before:
-            self.cc = 3
+        self.cc = 3 if overflow else (0 if result == 0 else (1 if result & 0x8000_0000_0000_0000 else 2))
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_SRDA(self, i: Instruction) -> None:
@@ -869,6 +958,8 @@ class CPU:
 
     def op_CS(self, i: Instruction) -> None:
         addr = self._rs_addr(i)
+        if addr % 4:
+            raise SpecificationException("CS operand not word-aligned", i.address)
         old = self.fetch_u32(addr, i.address)
         if old == self.r[i.r1]:
             self.store_u32(addr, self.r[i.r3], i.address)
@@ -882,6 +973,8 @@ class CPU:
         if i.r1 % 2:
             raise SpecificationException("CDS odd first operand", i.address)
         addr = self._rs_addr(i)
+        if addr % 8:
+            raise SpecificationException("CDS operand not doubleword-aligned", i.address)
         old1 = self.fetch_u32(addr, i.address)
         old2 = self.fetch_u32(addr + 4, i.address)
         if old1 == self.r[i.r1] and old2 == self.r[i.r1 + 1]:
@@ -899,12 +992,15 @@ class CPU:
         return [k for k in range(4) if mask & (1 << (3 - k))]
 
     def op_CLM(self, i: Instruction) -> None:
+        # Contiguous second operand, as for ICM/STCM; a zero mask is CC 0.
         addr = self._rs_addr(i)
         offsets = self._mask_bytes(i.r3)
         if not offsets:
-            raise SpecificationException("CLM zero mask", i.address)
+            self.cc = 0
+            self.psw.ia = wrap24(i.address + i.length)
+            return
         left = [(self.r[i.r1] >> (24 - 8 * k)) & 0xFF for k in offsets]
-        right = [self.fetch_byte(addr + k, i.address) for k in offsets]
+        right = [self.fetch_byte(addr + position, i.address) for position in range(len(offsets))]
         if left == right:
             self.cc = 0
         elif left < right:
@@ -914,9 +1010,11 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_STCM(self, i: Instruction) -> None:
+        # "The bytes corresponding to ones in the mask are placed in the same
+        # order in successive and contiguous storage locations" (p. 141).
         addr = self._rs_addr(i)
-        for k in self._mask_bytes(i.r3):
-            self.store_byte(addr + k, (self.r[i.r1] >> (24 - 8 * k)) & 0xFF, i.address)
+        for position, k in enumerate(self._mask_bytes(i.r3)):
+            self.store_byte(addr + position, (self.r[i.r1] >> (24 - 8 * k)) & 0xFF, i.address)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_ICM(self, i: Instruction) -> None:
@@ -930,18 +1028,22 @@ class CPU:
         addr = self._rs_addr(i)
         offsets = self._mask_bytes(i.r3)
         if not offsets:
-            # A zero mask inserts nothing: CC 0, no access, no exception.
-            self.r[i.r1] = 0
+            # A zero mask inserts nothing: CC 0, no access, no exception, and
+            # the register is unchanged.
             self.cc = 0
             self.psw.ia = wrap24(i.address + i.length)
             return
-        value = 0
+        # "Bytes are fetched from contiguous storage locations beginning at the
+        # second-operand address. The bytes in the general register
+        # corresponding to zeros in the mask remain unchanged" (p. 130).
+        value = self.r[i.r1]
         first_byte = None
-        for k in offsets:
-            byte = self.fetch_byte(addr + k, i.address)
+        for position, k in enumerate(offsets):
+            byte = self.fetch_byte(addr + position, i.address)
             if first_byte is None:
                 first_byte = byte
-            value |= byte << (24 - 8 * k)
+            shift = 24 - 8 * k
+            value = (value & ~(0xFF << shift)) | (byte << shift)
         self.r[i.r1] = value
         if value == 0:
             self.cc = 0
@@ -1012,10 +1114,13 @@ class CPU:
         raise PrivilegedOperation("LPSW", i.address)
 
     def op_TS(self, i: Instruction) -> None:
+        # "The leftmost bit (bit position 0) of the byte ... is used to set the
+        # condition code, and then the entire addressed byte is set to all
+        # ones" (GA22-7000-4, p. 144). CC 0 = leftmost bit zero, 1 = one.
         addr = self._si_addr(i)
         byte = self.fetch_byte(addr, i.address)
         self.store_byte(addr, 0xFF, i.address)
-        self.cc = 0 if byte == 0 else 1
+        self.cc = 1 if byte & 0x80 else 0
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_DIAG(self, i: Instruction) -> None:
@@ -1054,15 +1159,21 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_MVN(self, i: Instruction) -> None:
+        # MOVE NUMERICS: the low-order four bits (the numeric bits) of each
+        # second-operand byte replace the numeric bits of the first operand.
         dest, src = self._ss_addrs(i)
-        for k in range(i.l + 1):
-            self.memory[dest + k] = (self.memory[dest + k] & 0x0F) | (self.memory[src + k] & 0xF0)
+        for k in range(i.l1 + 1):
+            self.memory[dest + k] = (self.memory[dest + k] & 0xF0) | (self.memory[src + k] & 0x0F)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_MVZ(self, i: Instruction) -> None:
+        # MOVE ZONES: "The high-order four bits of each byte in the
+        # second-operand field (the zones) are placed in the high-order four
+        # bit positions of the corresponding bytes in the first-operand field"
+        # (GA22-7000-4, p. 136).
         dest, src = self._ss_addrs(i)
-        for k in range(i.l + 1):
-            self.memory[dest + k] = (self.memory[dest + k] & 0xF0) | (self.memory[src + k] & 0x0F)
+        for k in range(i.l1 + 1):
+            self.memory[dest + k] = (self.memory[dest + k] & 0x0F) | (self.memory[src + k] & 0xF0)
         self.psw.ia = wrap24(i.address + i.length)
 
     def _ss_logic(self, i: Instruction, op) -> None:
@@ -1105,16 +1216,24 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_TRT(self, i: Instruction) -> None:
+        """TRANSLATE AND TEST.
+
+        "the related argument address is inserted in the low-order 24 bits of
+        general register 1... The function byte is inserted in the low-order
+        eight bits of general register 2" (GA22-7000-4, p. 146). CC 1 when
+        argument bytes remain, CC 2 when the last byte is the only hit.
+        """
         dest, table = self._ss_addrs(i)
-        for k in range(i.l + 1):
+        n = i.l1 + 1
+        for k in range(n):
             function = self.memory[table + self.memory[dest + k]]
             if function:
-                self.r[1] = function
-                self.r[2] = dest + k
-                self.cc = 1 if k == 0 else 2
+                self.r[1] = (self.r[1] & 0xFF000000) | ((dest + k) & MASK24)
+                self.r[2] = (self.r[2] & 0xFFFFFF00) | function
+                self.cc = 2 if k == n - 1 else 1
                 self.psw.ia = wrap24(i.address + i.length)
                 return
-        self.r[2] = dest
+        # "the contents of general registers 1 and 2 remain unchanged"
         self.cc = 0
         self.psw.ia = wrap24(i.address + i.length)
 
@@ -1128,8 +1247,8 @@ class CPU:
         surplus high-order digits discarded.
         """
         dest, src = self._ss_addrs(i)
-        n_src = i.l + 1
-        n_dst = i.l + 1
+        n_src = i.l2 + 1
+        n_dst = i.l1 + 1
 
         # Digested right-to-left: digit from each source byte's low nibble,
         # sign from the high nibble of the last (low-order) source byte.
@@ -1157,8 +1276,8 @@ class CPU:
         the field is zero-filled on the left.
         """
         dest, src = self._ss_addrs(i)
-        n_src = i.l + 1
-        n_dst = i.l + 1
+        n_src = i.l2 + 1
+        n_dst = i.l1 + 1
 
         nibbles: list[int] = []
         for k in range(n_src):
@@ -1180,7 +1299,10 @@ class CPU:
         self.psw.ia = wrap24(i.address + i.length)
 
     def _privileged_ss(self, i: Instruction) -> None:
-        raise PrivilegedOperation(i.name, i.address)
+        # The decimal-feature instructions are unprivileged; this emulator does
+        # not implement the decimal feature, so executing one is an operation
+        # exception, not a privileged-operation exception.
+        raise OperationException(f"{i.name} (decimal feature not implemented)", i.address)
 
     op_ED = _privileged_ss
     op_EDMK = _privileged_ss
@@ -1225,5 +1347,6 @@ def _with_address(ins: Instruction, address: int) -> Instruction:
         fmt=ins.fmt,
         length=4,  # EX always advances by the RX instruction's length
         b1=ins.b1, d1=ins.d1, b2=ins.b2, d2=ins.d2,
-        r1=ins.r1, r2=ins.r2, r3=ins.r3, i2=ins.i2, l=ins.l, raw=ins.raw,
+        r1=ins.r1, r2=ins.r2, r3=ins.r3, i2=ins.i2,
+        l1=ins.l1, l2=ins.l2, raw=ins.raw,
     )

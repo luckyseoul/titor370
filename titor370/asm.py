@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .isa import Fmt, OPCODES, encode
+from .isa import SS_TWO_LENGTHS, Fmt, OPCODES, encode
 
 
 class AsmError(Exception):
@@ -42,7 +42,8 @@ BRANCH_ALIASES: dict[str, int] = {
     "BE": 8, "BNE": 7,
     "BL": 4, "BNL": 11,
     "BH": 2, "BNH": 13,
-    "BLE": 12, "BHE": 3,
+    "BLE": 12,
+    "BZ": 8, "BNZ": 7, "BM": 4, "BNM": 11, "BP": 2, "BNP": 13,
     "BO": 1, "BNO": 14,
 }
 
@@ -278,95 +279,38 @@ class Assembler:
 
     # ------------- directives -------------
 
-    def dc(self, operands: str, current: int) -> bytes:
+    # Constants are aligned to their natural boundaries, as the IBM assembler
+    # does: F and A on fullwords, H on halfwords, D on doublewords.
+    ALIGNMENT = {"F": 4, "A": 4, "H": 2, "D": 8}
+
+    def dc(self, operands: str, start: int) -> bytes:
         out = bytearray()
-        for item in split_operands(operands):
-            m = re.fullmatch(r"(\d*)([FHCXAB])'(.*)'", item.strip(), re.S)
-            if not m:
-                raise AsmError(f"bad constant {item!r}")
-            repeat = int(m.group(1) or 1)
-            kind, body = m.group(2), m.group(3)
-            for _ in range(repeat):
-                out += self._one_constant(kind, body, current)
-        return bytes(out)
-
-    def _one_constant(self, kind: str, body: str, current: int) -> bytes:
-        out = bytearray()
-        if True:
-            if kind == "F":
-                out += (self.eval(body, current) & 0xFFFFFFFF).to_bytes(4, "big")
-            elif kind == "H":
-                out += (self.eval(body, current) & 0xFFFF).to_bytes(2, "big")
-            elif kind == "C":
-                out += body.encode("cp037")  # EBCDIC, as S/370 would
-            elif kind == "X":
-                out += bytes.fromhex(re.sub(r"\s+", "", body))
-            elif kind == "B":
-                bits = re.sub(r"\s+", "", body)
-                value = int(bits, 2) if bits else 0
-                width = max(1, (len(bits) + 7) // 8)
-                out += value.to_bytes(width, "big")
-            elif kind == "A":
-                out += (self.eval(body, current) & 0xFFFFFF).to_bytes(4, "big")
-        return bytes(out)
-
-    def ds(self, operands: str, current: int) -> int:
-        m = re.fullmatch(r"\s*(\d*)\s*([FHDCX]?)\s*", operands)
-        if not m:
-            raise AsmError(f"bad DS operand {operands!r}")
-        count = int(m.group(1) or 1)
-        unit = {"F": 4, "H": 2, "D": 8, "C": 1, "X": 1, "": 1}[m.group(2)]
-        return count * unit
-
-    # ------------- assembly -------------
-
-    def dc_size(self, operands: str) -> int:
-        """Size of a DC in bytes, without needing operand values (pass 1)."""
-        total = 0
-        for item in split_operands(operands):
-            parsed = _const_match(item)
-            if not parsed:
-                raise AsmError(f"bad constant {item!r}")
-            count, kind, body = parsed
-            total += count * self._one_size(kind, body)
-        return total
-
-    @staticmethod
-    def _one_size(kind: str, body: str) -> int:
-        if kind in ("F", "A"):
-            return 4
-        if kind == "H":
-            return 2
-        if kind == "C":
-            return len(body.encode("cp037"))
-        if kind == "X":
-            return len(re.sub(r"\s+", "", body)) // 2
-        if kind == "A":
-            return 4
-        if kind == "B":
-            bits = re.sub(r"\s+", "", body)
-            return max(1, (len(bits) + 7) // 8)
-        raise AsmError(f"unsupported constant type {kind!r}")
-
-    def dc(self, operands: str, current: int) -> bytes:
-        out = bytearray()
+        address = start
         for item in split_operands(operands):
             parsed = _const_match(item)
             if not parsed:
                 raise AsmError(f"bad constant {item!r}")
             repeat, kind, body = parsed
-            out += self._one_constant(kind, body, current) * repeat
+            for _ in range(repeat):
+                pad = (-address) % self.ALIGNMENT.get(kind, 1)
+                out += bytes(pad)
+                address += pad
+                data = self._one_constant(kind, body, address)
+                out += data
+                address += len(data)
         return bytes(out)
 
     def _one_constant(self, kind: str, body: str, current: int) -> bytes:
-        if kind == "A":
-            return (self.eval(body, current) & 0xFFFFFF).to_bytes(4, "big")
         if kind == "F":
             return (self.eval(body, current) & 0xFFFFFFFF).to_bytes(4, "big")
+        if kind == "A":
+            return (self.eval(body, current) & 0xFFFFFF).to_bytes(4, "big")
         if kind == "H":
             return (self.eval(body, current) & 0xFFFF).to_bytes(2, "big")
+        if kind == "D":
+            return (self.eval(body, current) & 0xFFFF_FFFF_FFFF_FFFF).to_bytes(8, "big")
         if kind == "C":
-            return body.encode("cp037")  # EBCDIC, as S/370 would store it
+            return body.encode("cp037")  # EBCDIC, as S/370 stores characters
         if kind == "X":
             return bytes.fromhex(re.sub(r"\s+", "", body))
         if kind == "B":
@@ -374,9 +318,73 @@ class Assembler:
             value = int(bits, 2) if bits else 0
             width = max(1, (len(bits) + 7) // 8)
             return value.to_bytes(width, "big")
-        if kind == "A":
-            return (self.eval(body, current) & 0xFFFFFF).to_bytes(4, "big")
         raise AsmError(f"unsupported constant type {kind!r}")
+
+    @staticmethod
+    def _unit_size(kind: str) -> int:
+        return {"F": 4, "A": 4, "H": 2, "D": 8, "C": 1, "X": 1, "": 1}[kind]
+
+    def _one_size(self, kind: str, body: str) -> int:
+        if kind in ("C", "X", "B"):
+            if kind == "C":
+                return len(body.encode("cp037"))
+            if kind == "X":
+                return len(re.sub(r"\s+", "", body)) // 2
+            bits = re.sub(r"\s+", "", body)
+            return max(1, (len(bits) + 7) // 8)
+        return self._unit_size(kind)
+
+    def dc_size(self, operands: str, start: int) -> int:
+        """Bytes a DC occupies, including internal alignment, from *start*."""
+        total = 0
+        address = start
+        for item in split_operands(operands):
+            parsed = _const_match(item)
+            if not parsed:
+                raise AsmError(f"bad constant {item!r}")
+            repeat, kind, body = parsed
+            for _ in range(repeat):
+                pad = (-address) % self.ALIGNMENT.get(kind, 1)
+                total += pad
+                address += pad
+                size = self._one_size(kind, body)
+                total += size
+                address += size
+        return total
+
+    def ds(self, operands: str, current: int) -> int:
+        """Bytes reserved by DS, including the alignment padding it may add.
+
+        `DS 0F` aligns to a fullword without reserving anything.
+        """
+        m = re.fullmatch(r"\s*(\d*)\s*([FHDACX]?)\s*", operands)
+        if not m:
+            raise AsmError(f"bad DS operand {operands!r}")
+        count = int(m.group(1) or 1)
+        kind = m.group(2)
+        pad = (-current) % self.ALIGNMENT.get(kind, 1) if kind in self.ALIGNMENT else 0
+        return pad + count * self._unit_size(kind)
+
+    def _aligned_start(self, ln: Line, current: int) -> int:
+        """Address a DC or DS line actually begins at, after alignment.
+
+        A label on `TABLE DC F'10'` must point at the first byte of the
+        constant, not at the padding that precedes it.
+        """
+        if ln.mnemonic == "DC":
+            items = split_operands(ln.operands)
+            if not items:
+                return current
+            parsed = _const_match(items[0])
+            if not parsed:
+                return current
+            _repeat, kind, _body = parsed
+            return current + (-current) % self.ALIGNMENT.get(kind, 1)
+        if ln.mnemonic == "DS":
+            m = re.fullmatch(r"\s*(\d*)\s*([FHDACX]?)\s*", ln.operands)
+            if m and m.group(2) in self.ALIGNMENT:
+                return current + (-current) % self.ALIGNMENT[m.group(2)]
+        return current
 
     def assemble(self, source: str) -> dict:
         lines = [parse_line(t, n + 1) for n, t in enumerate(source.splitlines())]
@@ -389,7 +397,8 @@ class Assembler:
                 if ln.mnemonic == "EQU":
                     self.symbols[ln.label] = self.eval(ln.operands, current) if ln.operands else current
                 else:
-                    self.symbols[ln.label] = current
+                    # Labels name the aligned address a constant starts at.
+                    self.symbols[ln.label] = self._aligned_start(ln, current)
             if ln.mnemonic in ("EQU", ""):
                 continue
             if ln.mnemonic == "ORG":
@@ -406,7 +415,7 @@ class Assembler:
             if ln.mnemonic == "END":
                 break
             if ln.mnemonic == "DC":
-                current += self.dc_size(ln.operands)
+                current += self.dc_size(ln.operands, current)
                 continue
             if ln.mnemonic == "DS":
                 current += self.ds(ln.operands, current)
@@ -520,10 +529,11 @@ class Assembler:
             return encode(name, r1, r3, b, d)
 
         if fmt is Fmt.SI:
-            imm = self.eval(ops[0], current) if ops else 0
+            # IBM syntax: MVI D1(B1),I2 -- address first, immediate second.
+            d, _x, b = self.parse_dxbr(ops[0] if ops else "0", current, False)
+            imm = self.eval(ops[1], current) if len(ops) > 1 else 0
             if not 0 <= imm <= 0xFF:
                 raise AsmError(f"immediate out of range: {imm}")
-            d, _x, b = self.parse_dxbr(ops[1] if len(ops) > 1 else "0", current, False)
             return encode(name, imm, b, d)
 
         if fmt is Fmt.SS:
@@ -541,9 +551,9 @@ class Assembler:
                 l2 = l1
             if l1 == 0:
                 l1 = l2
-            if l1 != l2:
-                raise AsmError("SS operands must have equal lengths")
-            return encode(name, l1, b1, d1, b2, d2)
+            if name not in SS_TWO_LENGTHS and l1 != l2:
+                raise AsmError(f"{name} takes a single length for both operands")
+            return encode(name, l1, l2, b1, d1, b2, d2)
 
         # S format
         d, _x, b = self.parse_dxbr(ops[0] if ops else "0", current, False)

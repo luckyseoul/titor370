@@ -108,6 +108,19 @@ Four rules that are easy to get wrong, and that this implementation gets right:
 4. **`MVC` propagates on overlap** — it stores as it fetches, so copying `ABCDE` onto itself
    one byte to the right yields `AAAAA`, not a memmove'd result.
 
+
+## An independent review
+
+`REVIEW.md` records a review of this project against Hercules, a mature System/370 emulator,
+plus the source of both. It found a dozen genuine misreadings of the Principles of Operation —
+among them `MR`'s multiplicand, `DR`'s quotient/remainder order, `MVN`/`MVZ`, `SLR`'s condition
+code, `TRT`'s registers, and `SLA`'s sign handling. Every finding was re-checked against
+GA22-7000-4 before being accepted; all are fixed, and `REVIEW.md` now ends with a response
+table naming the page that settles each one.
+
+That review is the reason to trust the test suite more than the README: the tests and the code
+were wrong together, and only an outside oracle could show it.
+
 ## Where the encodings come from
 
 Not from memory. IBM GA22-7000-4, *System/370 Principles of Operation*, September 1975 —
@@ -123,7 +136,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-598 passed
+620 passed
 ```
 
 Three kinds of test:
@@ -211,9 +224,13 @@ make the interpreter and the translator disagree if either is wrong.
   `BALR r,0` are propagated so ordinary `USING`-style code resolves correctly.
 - **No decimal arithmetic.** `AP`/`SP`/`MP`/`DP`/`ZAP` and friends are unimplemented; `PACK`,
   `UNPK`, `CVD` and `CVB` are implemented and tested.
-- **Not translated:** SVC, MVCL, CLCL, EX, CDS, LPSW, SSM. The interpreter runs these (or
+- **Not translated:** SVC, MVCL, CLCL, EX, CDS, LPSW, SSM, LRA. The interpreter runs these (or
   raises for the privileged ones); the C translator does not emit code for them, and
   `tests/test_coverage.py` fails if this list and the code disagree.
+- **Self-modifying programs are not translated.** The generated C checks every store against
+  the translated instruction ranges and stops with a message rather than continuing with stale
+  code. The interpreter handles such programs correctly, so this is a real difference between
+  the two paths, not a shared limitation.
 
 ## Why this exists
 

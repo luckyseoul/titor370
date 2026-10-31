@@ -75,7 +75,8 @@ def random_program(rng: random.Random, origin: int = 0x1000) -> str:
                 lines.append(f"         {name:<5} {r1},{r1 + 2},{rng.randrange(0, 0x20) * 4}(13)")
         elif kind == "SI":
             name = rng.choice(SI)
-            lines.append(f"         {name:<5} X'{rng.randrange(256):02X}',{rng.randrange(0, 0x20) * 4}(13)")
+            # IBM syntax: MVI D1(B1),I2.
+            lines.append(f"         {name:<5} {rng.randrange(0, 0x20) * 4}(13),X'{rng.randrange(256):02X}'")
         else:
             name = rng.choice(SS)
             n = rng.randrange(1, 9)
@@ -140,7 +141,11 @@ def run_case(source: str, workdir: pathlib.Path) -> tuple[bool, str]:
         return False, f"compile failed\n{build.stderr}"
     run = subprocess.run([str(exe)], capture_output=True, text=True)
     if run.returncode != 0:
-        # The interpreter completed, so the C bailing out is a divergence.
+        if "store into translated code" in run.stderr:
+            # A store whose address depends on a random register landed in the
+            # code. The interpreter decodes the new bytes; static translation
+            # cannot follow that, so the case is out of scope by design.
+            return True, "skipped (self-modifying: store into translated code)"
         return False, f"translated program exited {run.returncode}: {run.stderr.strip()}"
 
     parsed = {}
@@ -181,7 +186,7 @@ def main() -> int:
         for index in range(args.iterations):
             source = random_program(rng)
             ok, detail = run_case(source, workdir)
-            if detail.startswith("interpreter raised"):
+            if detail.startswith("interpreter raised") or detail.startswith("skipped"):
                 skipped += 1
                 continue
             if not ok:

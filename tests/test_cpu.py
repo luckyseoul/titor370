@@ -71,34 +71,43 @@ def test_alr_carry_is_cc2_and_cc3():
     assert cpu.r[1] == 1 and cpu.cc == 3
 
 
-def test_slr_borrow_is_cc2_and_cc3():
-    # 0 - 1 = 0xFFFFFFFF, borrow, non-zero: CC 3
+def test_slr_condition_code_follows_the_carry_out_of_the_sign():
+    # SUBTRACT LOGICAL (GA22-7000-4, p. 144): CC 1 = difference nonzero with no
+    # carry; 2 = zero with carry; 3 = nonzero with carry. A zero difference
+    # cannot occur without a carry, so CC 0 is never produced.
+    # 0 - 1: borrow, so no carry; difference nonzero -> CC 1
     cpu = run_one("SLR", regs={1: 0, 2: 1}, fields=(1, 2))
-    assert cpu.r[1] == 0xFFFFFFFF and cpu.cc == 3
-    # 5 - 5 = 0, no borrow: CC 0
+    assert cpu.r[1] == 0xFFFFFFFF and cpu.cc == 1
+    # 5 - 5: carry, zero difference -> CC 2
     cpu = run_one("SLR", regs={1: 5, 2: 5}, fields=(1, 2))
-    assert cpu.r[1] == 0 and cpu.cc == 0
+    assert cpu.r[1] == 0 and cpu.cc == 2
+    # 9 - 4: carry, nonzero -> CC 3
+    cpu = run_one("SLR", regs={1: 9, 2: 4}, fields=(1, 2))
+    assert cpu.r[1] == 5 and cpu.cc == 3
 
 
-def test_mr_makes_a_signed_64_bit_product():
-    cpu = run_one("MR", regs={4: 2, 6: 3}, fields=(4, 6))
+def test_mr_multiplies_the_odd_register_by_the_multiplier():
+    # "The multiplicand is taken from the odd register of the pair"
+    # (GA22-7000-4, p. 136), and the product replaces R1:R1+1.
+    cpu = run_one("MR", regs={4: 0xDEADBEEF, 5: 2, 6: 3}, fields=(4, 6))
     assert cpu.r[4] == 0 and cpu.r[5] == 6
 
-    cpu = run_one("MR", regs={4: 0xFFFFFFFE, 6: 3}, fields=(4, 6))
+    cpu = run_one("MR", regs={4: 0x11111111, 5: 0xFFFFFFFE, 6: 3}, fields=(4, 6))
     assert cpu.r[4] == 0xFFFFFFFF and cpu.r[5] == 0xFFFFFFFA  # -6
 
 
 def test_dr_quotient_and_remainder():
-    # dividend 100 in R4:R5, divisor 7 -> quotient 14, remainder 2
+    # Dividend 100 in R4:R5, divisor 7. The remainder goes in the even
+    # register and the quotient in the odd one (GA22-7000-4, p. 128).
     cpu = run_one("DR", regs={4: 0, 5: 100, 6: 7}, fields=(4, 6))
-    assert cpu.r[4] == 14 and cpu.r[5] == 2
+    assert cpu.r[4] == 2 and cpu.r[5] == 14
 
 
 def test_dr_truncates_toward_zero():
     # -100 / 7 = -14 remainder -2 (S/370 truncates, like C)
     cpu = run_one("DR", regs={4: 0xFFFFFFFF, 5: 0xFFFFFF9C, 6: 7}, fields=(4, 6))
-    assert cpu.r[4] == (-14) & 0xFFFFFFFF
-    assert cpu.r[5] == (-2) & 0xFFFFFFFF
+    assert cpu.r[4] == (-2) & 0xFFFFFFFF     # remainder, even register
+    assert cpu.r[5] == (-14) & 0xFFFFFFFF    # quotient, odd register
 
 
 def test_dr_divide_by_zero_raises():
@@ -198,9 +207,11 @@ def test_bct_decrements_then_branches_when_nonzero():
 
 
 def test_balr_zero_second_operand_does_not_branch():
-    # The base-register idiom: R12 gets the next address, execution continues.
+    # The base-register idiom: the link word goes to R12 and execution
+    # continues. The link word is ILC|CC|mask|address, and ILC is 1 for a
+    # two-byte instruction (GA22-7000-4, p. 121).
     cpu = run_one("BALR", regs={}, fields=(12, 0))
-    assert cpu.r[12] == BASE + 2
+    assert cpu.r[12] == (1 << 30) | (BASE + 2)
     assert cpu.psw.ia == BASE + 2
 
 
@@ -243,9 +254,23 @@ def test_sra_keeps_the_sign():
     assert cpu.cc == 1
 
 
-def test_sla_overflow_sets_cc3():
+def test_sla_preserves_the_sign_and_detects_overflow():
+    # "The sign of the first operand remains unchanged. All 31 integer bits
+    # participate... If a bit unlike the sign bit is shifted out of position 1,
+    # an overflow occurs" (GA22-7000-4, p. 139).
+    # Positive 0x40000000 shifted left one: a 1 leaves position 1 while the
+    # sign is 0, so this overflows, and the sign stays 0.
     cpu = run_one("SLA", regs={1: 0x40000000}, fields=(1, 0, 0, 1))
-    assert cpu.r[1] == 0x80000000 and cpu.cc == 3
+    assert cpu.cc == 3
+    assert cpu.r[1] == 0x80000000 if False else (cpu.r[1] & 0x80000000) == 0
+
+    # A negative number keeps its sign: -1 shifted left stays negative.
+    cpu = run_one("SLA", regs={1: 0xFFFFFFFF}, fields=(1, 0, 0, 1))
+    assert cpu.r[1] & 0x80000000
+
+    # No overflow: 1 << 1 = 2.
+    cpu = run_one("SLA", regs={1: 1}, fields=(1, 0, 0, 1))
+    assert cpu.r[1] == 2 and cpu.cc == 2
 
 
 def test_shift_amount_is_masked_to_six_bits():
@@ -330,15 +355,30 @@ def test_translate_and_test_reports_the_first_hit():
         mem={0x200: b"\x88\x85\x93\x96", 0x300: bytes(table)},
         fields=(3, 0, 0x200, 0, 0x300),
     )
-    assert cpu.cc == 2          # found, not in the first position
-    assert cpu.r[1] == 0x07     # the function byte
-    assert cpu.r[2] == 0x203    # address of the hit
+    # The hit is the last byte of a four-byte field, so the code is 2.
+    assert cpu.cc == 2
+    assert cpu.r[1] == 0x203    # address of the argument byte (low 24 bits)
+    assert cpu.r[2] == 0x07     # the function byte (low 8 bits)
 
 
-def test_trt_no_hit_cc0():
-    cpu = run_one("TRT", mem={0x200: b"abcd", 0x300: bytes(256)}, fields=(3, 0, 0x200, 0, 0x300))
+def test_trt_cc1_when_the_hit_is_not_the_last_byte():
+    table = bytearray(256)
+    table[0x85] = 0x09
+    cpu = run_one(
+        "TRT",
+        mem={0x200: b"\x88\x85\x93\x96", 0x300: bytes(table)},
+        fields=(3, 0, 0x200, 0, 0x300),
+    )
+    assert cpu.cc == 1                 # a hit with bytes still to be tested
+    assert cpu.r[1] == 0x201
+    assert cpu.r[2] == 0x09
+
+
+def test_trt_no_hit_leaves_the_registers_alone():
+    cpu = run_one("TRT", regs={1: 0x11111111, 2: 0x22222222},
+                  mem={0x200: b"abcd", 0x300: bytes(256)}, fields=(3, 0, 0x200, 0, 0x300))
     assert cpu.cc == 0
-    assert cpu.r[2] == 0x200
+    assert cpu.r[1] == 0x11111111 and cpu.r[2] == 0x22222222
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +399,7 @@ def test_unpack_right_aligns_and_signs_the_low_byte():
     cpu = run_one(
         "UNPK",
         mem={0x200: bytes.fromhex("000012345C")},
-        fields=(4, 0, 0x500, 0, 0x200),
+        fields=(4, 4, 0, 0x500, 0, 0x200),
     )
     assert cpu.read(0x500, 5) == bytes.fromhex("F0F0F0F0C5")
 
@@ -412,16 +452,18 @@ def test_icm_zero_mask_is_not_an_error():
 
 
 def test_icm_inserts_selected_bytes():
-    # Mask 0x9 = 1001 selects the leftmost and rightmost byte positions.
-    cpu = run_one("ICM", mem={0x200: b"\xAA\x00\x00\xBB"}, fields=(1, 0x9, 0, 0x200))
-    assert cpu.r[1] == 0xAA0000BB
+    # Mask 0x9 = 1001 selects the leftmost and rightmost byte positions, but
+    # the storage operand is contiguous: the two bytes come from 0x200, 0x201.
+    cpu = run_one("ICM", regs={1: 0x11223344}, mem={0x200: b"\xAA\xBB"},
+                  fields=(1, 0x9, 0, 0x200))
+    assert cpu.r[1] == 0xAA2233BB     # unselected bytes keep their old values
 
 
-def test_stcm_stores_selected_bytes():
-    # Mask 0xA = 1010 selects the leftmost and third bytes of the register.
+def test_stcm_stores_selected_bytes_contiguously():
+    # Mask 0xA = 1010 selects bytes 0 and 2 of the register, which are stored
+    # in successive locations from 0x200 (p. 141).
     cpu = run_one("STCM", regs={1: 0x11223344}, fields=(1, 0xA, 0, 0x200))
-    assert cpu.read(0x200, 4)[0] == 0x11
-    assert cpu.read(0x200, 4)[2] == 0x33
+    assert cpu.read(0x200, 2) == b"\x11\x33"
 
 
 def test_cs_swaps_when_equal():
@@ -452,13 +494,13 @@ def test_ex_executes_the_subject_with_the_mask_ored_in():
     assert cpu.read(0x300, 4) == encode("MVI", 0x40, 2, 0)  # subject left intact
 
 
-def test_mvn_and_mvz_move_half_bytes():
-    # MVN copies the zone (high nibble) of the source into the destination
+def test_mvn_moves_numerics_and_mvz_moves_zones():
+    # MVN moves the numeric (low-order four) bits of each source byte.
     cpu = run_one("MVN", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
-    assert cpu.read(0x200, 2) == b"\x31\x42"
-    # MVZ copies the numeric (low nibble) of the source into the destination
-    cpu = run_one("MVZ", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
     assert cpu.read(0x200, 2) == b"\xFA\xFB"
+    # MVZ moves the zones (high-order four bits).
+    cpu = run_one("MVZ", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
+    assert cpu.read(0x200, 2) == b"\x31\x42"
 
 
 # ---------------------------------------------------------------------------
@@ -471,3 +513,153 @@ def test_privileged_instructions_raise(name):
     fields = (0, 0x200) if name in ("SSM", "LPSW") else (0xF0, 0, 0x200)
     with pytest.raises(PrivilegedOperation):
         run_one(name, fields=fields)
+
+
+# ---------------------------------------------------------------------------
+# Rules established by the independent review against Hercules
+# ---------------------------------------------------------------------------
+
+
+def test_bal_link_word_carries_ilc_cc_and_mask():
+    # "The link information ... consists of the instruction-length code, the
+    # condition code, the program mask bits, and the updated instruction
+    # address" (GA22-7000-4, p. 121). BAL is four bytes, so ILC = 2.
+    cpu = CPU()
+    cpu.load(BASE, encode("BAL", 14, 0, 0, 0x200))
+    cpu.psw.cc = 2
+    cpu.psw.pmask = 0x9
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.r[14] == (2 << 30) | (2 << 28) | (0x9 << 24) | (BASE + 4)
+    assert cpu.psw.ia == 0x200
+
+
+def test_cs_requires_word_alignment():
+    with pytest.raises(SpecificationException):
+        run_one("CS", regs={1: 1, 3: 2}, mem={0x201: b"\x00\x00\x00\x00"}, fields=(1, 3, 0, 0x201))
+
+
+def test_cds_requires_doubleword_alignment():
+    with pytest.raises(SpecificationException):
+        run_one("CDS", regs={2: 1, 3: 2, 4: 3, 5: 4}, mem={0x204: bytes(8)}, fields=(2, 4, 0, 0x204))
+
+
+def test_lra_is_privileged():
+    with pytest.raises(PrivilegedOperation):
+        run_one("LRA", fields=(1, 0, 0, 0x200))
+
+
+@pytest.mark.parametrize("name", ["AP", "SP", "MP", "DP", "ZAP", "CP"])
+def test_decimal_instructions_are_operation_exceptions_not_privileged(name):
+    # The decimal feature is not installed; that is an operation exception,
+    # not a privileged-operation exception.
+    from titor370.cpu import OperationException
+
+    cpu = CPU()
+    cpu.load(BASE, encode(name, 1, 1, 0, 0x200, 0, 0x300))
+    cpu.psw.ia = BASE
+    with pytest.raises(OperationException) as info:
+        cpu.step()
+    assert info.value.code == 0x01
+
+
+def test_ex_of_ex_is_an_execute_exception():
+    cpu = CPU()
+    # EX 0,TARGET where TARGET holds another EX.
+    cpu.load(BASE, encode("EX", 0, 0, 0, 0x300))
+    cpu.load(0x300, encode("EX", 0, 0, 0, 0x400))
+    cpu.psw.ia = BASE
+    with pytest.raises(Exception) as info:
+        cpu.step()
+    assert getattr(info.value, "code", None) == 0x03
+
+
+def test_ex_with_register_zero_does_not_modify_the_subject():
+    cpu = CPU()
+    cpu.load(BASE, encode("EX", 0, 0, 0, 0x300))     # R1 = 0: no modification
+    cpu.load(0x300, encode("MVI", 0x40, 2, 0))
+    cpu.r[0] = 0x0F                                   # must be ignored
+    cpu.r[2] = 0x200
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.fetch_byte(0x200) == 0x40              # not 0x4F
+
+
+def test_ex_requires_an_even_address():
+    with pytest.raises(SpecificationException):
+        run_one("EX", fields=(0, 0, 0, 0x301))
+
+
+def test_bct_computes_the_branch_address_before_decrementing():
+    # R1 doubles as the base register: the address must use the old value.
+    cpu = CPU()
+    cpu.load(BASE, encode("BCT", 1, 0, 1, 4))   # BCT 1,4(1)
+    cpu.r[1] = 0x1002
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.r[1] == 0x1001
+    assert cpu.psw.ia == 0x1006                  # 0x1002 + 4, not 0x1001 + 4
+
+
+def test_cvb_out_of_range_is_a_fixed_point_divide_and_loads_the_low_bits():
+    from titor370.cpu import FixedPointDivide
+
+    packed = bytes.fromhex("999999999999999C")   # far beyond 32 bits
+    cpu = CPU()
+    cpu.load(BASE, encode("CVB", 1, 0, 0, 0x200))
+    cpu.write(0x200, packed)
+    cpu.psw.ia = BASE
+    with pytest.raises(FixedPointDivide):
+        cpu.step()
+    assert cpu.r[1] == 999999999999999 & 0xFFFFFFFF
+
+
+def test_mvcl_moves_and_pads_with_the_24_bit_lengths():
+    # R1 = destination pair, R2 = source pair; lengths in bits 8-31 of R1+1
+    # and R2+1; the pad character is in bits 0-7 of R2+1 (p. 133).
+    cpu = CPU()
+    cpu.load(BASE, encode("MVCL", 2, 4))
+    cpu.r[2] = 0x300          # destination address
+    cpu.r[3] = 4              # destination length
+    cpu.r[4] = 0x200          # source address
+    cpu.r[5] = (0x00 << 24) | 2   # source length 2, pad 0x00
+    cpu.write(0x200, b"AB")
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.read(0x300, 4) == b"AB\x00\x00"
+    assert cpu.cc == 2        # first operand is longer
+    assert cpu.r[2] == 0x302 and cpu.r[4] == 0x202
+    assert cpu.r[3] == 2 and cpu.r[5] == 0
+
+
+def test_mvcl_destructive_overlap_moves_nothing():
+    cpu = CPU()
+    cpu.load(BASE, encode("MVCL", 2, 4))
+    cpu.r[2] = 0x201          # destination starts inside the source field
+    cpu.r[3] = 4
+    cpu.r[4] = 0x200
+    cpu.r[5] = 4
+    cpu.write(0x200, b"ABCD")
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.cc == 3
+    assert cpu.read(0x200, 5) == b"ABCD\x00"
+
+
+def test_clcl_compares_with_padding():
+    cpu = CPU()
+    cpu.load(BASE, encode("CLCL", 2, 4))
+    cpu.r[2] = 0x300
+    cpu.r[3] = 3              # first operand "AB\x00"
+    cpu.r[4] = 0x200
+    cpu.r[5] = (0x00 << 24) | 2   # second operand "AB", padded with zero
+    cpu.write(0x300, b"AB\x00")
+    cpu.write(0x200, b"AB")
+    cpu.psw.ia = BASE
+    cpu.step()
+    assert cpu.cc == 0        # equal once the shorter is padded
+
+
+def test_mvcl_requires_even_registers():
+    with pytest.raises(SpecificationException):
+        run_one("MVCL", fields=(3, 4))
