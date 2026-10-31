@@ -119,7 +119,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-262 passed
+584 passed
 ```
 
 Three kinds of test:
@@ -132,6 +132,10 @@ Three kinds of test:
 - **Equivalence** (`tests/test_equivalence.py`) — for every example program, the interpreter
   and the compiled C must agree on all 16 registers, the condition code, and the program's
   storage.
+- **Oracle** (`tests/test_oracle.py`) — arithmetic and comparison results are recomputed in
+  Python from their definitions across every edge-case pair (0, ±1, INT32_MIN/MAX, 0xFFFFFFFF,
+  …), plus random 64-bit products and divisions. 320 checks that cannot agree with the
+  emulator by accident.
 
 The example programs' expected results come from Python's own arithmetic
 (`sum([10,20,30,40,50])`, `math.factorial(10)`, `"HELLO WORLD".encode("cp037")`), not from the

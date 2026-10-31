@@ -398,6 +398,33 @@ def test_cs_loads_on_mismatch():
 
 
 # ---------------------------------------------------------------------------
+# Execute
+# ---------------------------------------------------------------------------
+
+
+def test_ex_executes_the_subject_with_the_mask_ored_in():
+    cpu = CPU()
+    cpu.load(0x1000, encode("EX", 1, 0, 0, 0x300))
+    cpu.load(0x300, encode("MVI", 0x40, 2, 0))   # MVI 0(2),X'40'
+    cpu.r[1] = 0x05
+    cpu.r[2] = 0x200
+    cpu.psw.ia = 0x1000
+    cpu.step()
+    assert cpu.fetch_byte(0x200) == 0x45         # 0x40 | 0x05
+    assert cpu.psw.ia == 0x1004                  # advance by EX's length, not the subject's
+    assert cpu.read(0x300, 4) == encode("MVI", 0x40, 2, 0)  # subject left intact
+
+
+def test_mvn_and_mvz_move_half_bytes():
+    # MVN copies the zone (high nibble) of the source into the destination
+    cpu = run_one("MVN", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
+    assert cpu.read(0x200, 2) == b"\x31\x42"
+    # MVZ copies the numeric (low nibble) of the source into the destination
+    cpu = run_one("MVZ", mem={0x200: b"\xF1\xF2", 0x300: b"\x3A\x4B"}, fields=(1, 0, 0x200, 0, 0x300))
+    assert cpu.read(0x200, 2) == b"\xFA\xFB"
+
+
+# ---------------------------------------------------------------------------
 # Privileged and unimplemented
 # ---------------------------------------------------------------------------
 
