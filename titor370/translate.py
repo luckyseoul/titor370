@@ -773,7 +773,8 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
         return out + [f'unimplemented(0x{ins.address:06X}u, "SVC is not translated");']
 
     # Instructions the interpreter implements but the translator does not.
-    if name in ("EX", "MVCL", "CLCL", "CDS", "SSM", "LPSW", "LRA"):
+    if name in ("EX", "MVCL", "CLCL", "CDS", "SSM", "LPSW", "LRA",
+                "AP", "SP", "MP", "DP", "ZAP", "CP"):
         return out + [f'unimplemented(0x{ins.address:06X}u, "{name} is not translated");']
 
     return out + [f'unimplemented(0x{ins.address:06X}u, "{name}");']

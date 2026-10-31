@@ -88,12 +88,13 @@ which is what any ahead-of-time translator does when the target is not staticall
 Implemented and tested: `AR SR ALR SLR LR LTR LNR LPR LCR NR OR XR CR CLR MR DR`,
 `BALR BCTR BCR SVC MVCL CLCL`, `L ST LA LH STH IC STC A S AL SL N O X C CL M D AH SH CH MH
 CVD CVB`, `EX BAL BCT BC LRA`, `SLL SRL SLA SRA SLDL SRDL SLDA SRDA STM LM BXH BXLE CS CDS
-CLM STCM ICM`, `TM MVI NI OI XI CLI`, `MVC MVN MVZ NC OC XC CLC TR TRT PACK UNPK`, `TS DIAG`.
+CLM STCM ICM`, `TM MVI NI OI XI CLI`, `MVC MVN MVZ NC OC XC CLC TR TRT PACK UNPK`, `TS DIAG`,
+and packed decimal: `AP SP MP DP ZAP CP`.
 
 Deliberately **not** implemented, and they raise a program check rather than pretending:
-`SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH`; the decimal arithmetic instructions
-(`AP SP MP DP ZAP CP ED EDMK SRP MVO`); **all floating point**, which the 5100 did not have
-either; `LPSW` and `SSM` (privileged); and DAT.
+`SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH`; the decimal *editing* and shift
+instructions (`ED EDMK SRP MVO`); **all floating point**, which the 5100 did not have either;
+`LPSW` and `SSM` (privileged); and DAT.
 
 ## Design notes worth knowing
 
@@ -138,6 +139,26 @@ naming the instruction and the illegal code.
 It does **not** catch every kind of error — `TS` produced the wrong condition code for a
 different reason (zero-ness instead of the leftmost bit) and stayed inside its legal set {0,1}.
 A condition-code oracle bounds the damage; it does not replace reading the page.
+
+## Packed decimal
+
+`AP SP MP DP ZAP CP` are implemented against chapter 7 of the manual: packed fields of 1–16
+bytes, sign nibbles 10/12/14/15 for plus and 11/13 for minus, and results always written with
+the preferred codes 12 and 13. Digits, lengths and signs are validated, so a malformed field
+raises a data exception rather than producing a plausible wrong number.
+
+`tests/test_decimal.py` checks every operation against Python's own integers through helpers
+that encode and decode packed fields independently of the emulator.
+
+Two things this found while being written:
+
+- **My program-mask bit assignment was wrong.** Decimal overflow is bit 0, fixed-point overflow
+  bit 1; I had used the fixed-point mask for all overflows.
+- **`MP` was setting a condition code.** The manual says its condition code is unchanged; the
+  condition-code oracle caught it immediately.
+
+The translator does not emit the decimal instructions yet, so `examples/decimal.s370` reports
+`SKIP` rather than `MATCH` — stated, not hidden.
 
 ## A program-exception oracle
 
@@ -184,7 +205,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-889 passed
+948 passed, 1 skipped
 ```
 
 Three kinds of test:

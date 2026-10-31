@@ -1,0 +1,23 @@
+*        Decimal arithmetic: 1234 + 5678 = 6912, then -100 + 3 = -97.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         ZAP   A(4),N1(3)        ; A = 1234
+         AP    A(4),N2(3)        ; A = 6912
+         ZAP   B(3),N3(2)        ; B = -100
+         AP    B(3),N4(2)        ; B = -97
+         CP    A(4),N2(3)        ; compare 6912 with 5678 -> high
+         MP    C(5),N5(1)        ; C = 1234 * 7 = 8638
+         DP    D(6),N6(1)        ; 1234 / 7 -> quotient 176, remainder 2
+         DIAG  0,0,0
+A        DS    4C
+B        DS    3C
+C        DC    X'000001234C'
+D        DC    X'00000001234C'
+N1       DC    X'01234C'
+N2       DC    X'05678C'
+N3       DC    X'100D'
+N4       DC    X'003C'
+N5       DC    X'7C'
+N6       DC    X'7C'
+         END   START

@@ -122,6 +122,17 @@ def cmd_compare(args) -> int:
     # Default: compare the whole loaded program plus a margin for DS-reserved data.
     window_len = args.window or (result["end"] - result["base"] + 64)
 
+    from .cpu import IMPLEMENTED  # noqa: F401  (documents the dependency)
+    from .isa import OPCODES
+
+    used = {w for w in pathlib.Path(args.source).read_text().split() if w in OPCODES}
+    untranslatable = used & {"AP", "SP", "MP", "DP", "ZAP", "CP", "MVCL", "CLCL",
+                             "EX", "CDS", "SVC", "SSM", "LPSW", "LRA", "ED", "EDMK",
+                             "SRP", "MVO"}
+    if untranslatable:
+        print(f"SKIP  uses {', '.join(sorted(untranslatable))}, which the translator does not emit")
+        return 0
+
     try:
         reference = _run_in_emulator(result, args.max_steps)
     except S370Error as exc:

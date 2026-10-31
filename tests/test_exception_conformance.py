@@ -38,6 +38,7 @@ from titor370.isa import OPCODES, Fmt, encode
 
 # Exception bits, named after the manual's abbreviations.
 A, SP, IF, IK, EX, M, D = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40
+DF, DK = 0x80, 0x100
 
 LEGEND_UNDERSTOOD = frozenset(
     {
@@ -71,6 +72,8 @@ EXCEPTIONS = {
     "CLM": {A, SP}, "STCM": {A}, "ICM": {A},
     "MVC": {A}, "MVN": {A}, "MVZ": {A}, "NC": {A}, "OC": {A}, "XC": {A},
     "CLC": {A}, "TR": {A}, "TRT": {A},
+    "AP": {A, D, DF}, "SP": {A, D, DF}, "ZAP": {A, D, DF},
+    "MP": {A, SP, D}, "DP": {A, SP, D, DK}, "CP": {A, D},
     "PACK": {A, SP}, "UNPK": {A},
     "MVI": {A}, "NI": {A}, "OI": {A}, "XI": {A},
     "TM": {A}, "CLI": {A},
@@ -98,6 +101,8 @@ def _kind(exc: BaseException) -> int | None:
             0x07: D,
             0x08: IF,
             0x09: IK,
+            0x0A: DF,
+            0x0B: DK,
         }.get(exc.code)
     return None
 
@@ -149,7 +154,7 @@ def _drive(name: str) -> tuple[set[int], set[int]]:
                     continue
                 cpu.load(0x1000, data)
                 cpu.psw.ia = 0x1000
-                # Bit 3 of the program mask enables the overflow interruption.
+                # Enable every program-mask interruption this model can raise.
                 cpu.psw.pmask = 0xF
                 cpu.halted = False
                 try:
@@ -231,7 +236,8 @@ def test_the_sweep_provokes_a_useful_share_of_the_documented_exceptions():
 
 
 def _names(bits: set[int]) -> str:
-    reverse = {A: "A", SP: "SP", IF: "IF", IK: "IK", EX: "EX", M: "M", D: "D"}
+    reverse = {A: "A", SP: "SP", IF: "IF", IK: "IK", EX: "EX", M: "M", D: "D",
+               DF: "DF", DK: "DK"}
     return "{" + ", ".join(reverse[b] for b in sorted(bits)) + "}" if bits else ""
 
 

@@ -191,6 +191,7 @@ class PSW:
 
 IMPLEMENTED = """
 AR SR ALR SLR LR LTR LNR LPR LCR NR OR XR CR CLR MR DR
+AP SP MP DP ZAP CP
 BALR BCTR BCR SVC MVCL CLCL
 L ST LA LH STH IC STC A S AL SL N O X C CL M D AH SH CH MH CVD CVB
 EX BAL BCT BC LRA
@@ -203,7 +204,7 @@ DIAG
 
 UNIMPLEMENTED = """
 SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH
-ED EDMK SRP MVO ZAP CP AP SP MP DP
+ED EDMK SRP MVO
 LRER LRDR LTER LTDR LCER LCDR
 AD ADR AE AER AW AWR AU AUR SD SDR SE SER SW SWR SU SUR
 MD MDR ME MER MXD MXDR MXR DD DDR DE DER
@@ -378,10 +379,11 @@ class CPU:
             self.cc = cc_for(result)
             return u32(result)
         # Overflow takes precedence over the sign (GA22-7000-4), and causes a
-        # program interruption only when the fixed-point overflow mask bit --
-        # bit 3 of the program mask, i.e. 0x8 -- is one.
+        # program interruption only when the fixed-point overflow mask bit is
+        # one. Program mask bit 0 is decimal overflow, bit 1 fixed-point
+        # overflow, bit 2 decimal divide, bit 3 exponent underflow.
         self.cc = 3
-        if self.psw.pmask & 0x8:
+        if self.psw.pmask & 0x4:
             raise FixedPointOverflow("fixed-point overflow", where)
         return u32(result)
 
@@ -1169,6 +1171,143 @@ class CPU:
         self._check(a2, max(first_len, i.l1 + 1, i.l2 + 1), i.address)
         return a1, a2
 
+    # ---------------- packed decimal ----------------
+
+    # Sign nibbles: 10, 12, 14 and 15 are plus; 11 and 13 are minus. Results are
+    # always written with the preferred codes 12 (plus) and 13 (minus)
+    # (GA22-7000-4, p. 148).
+    PLUS_SIGNS = frozenset({0xA, 0xC, 0xE, 0xF})
+    MINUS_SIGNS = frozenset({0xB, 0xD})
+    SIGN_PLUS = 0xC
+    SIGN_MINUS = 0xD
+
+    def _decimal_in(self, addr: int, length: int, what: str = "operand") -> int:
+        """Read a packed-decimal field and return its signed integer value."""
+        data = self.read(addr, length)
+        digits = []
+        for byte in data:
+            digits.append(byte >> 4)
+            digits.append(byte & 0x0F)
+        sign = digits.pop()
+        if sign not in self.PLUS_SIGNS and sign not in self.MINUS_SIGNS:
+            raise ProgramCheck(0x07, f"invalid packed sign in {what}", None)
+        if any(d > 9 for d in digits):
+            raise ProgramCheck(0x07, f"invalid packed digit in {what}", None)
+        value = int("".join(str(d) for d in digits)) if digits else 0
+        return -value if sign in self.MINUS_SIGNS else value
+
+    def _decimal_out(self, addr: int, length: int, value: int) -> None:
+        """Write *value* into a packed field of *length* bytes, right-aligned."""
+        capacity = 2 * length - 1
+        magnitude = abs(value)
+        digits = f"{magnitude:0{capacity}d}"[-capacity:] if capacity else ""
+        negative = value < 0
+        out = bytearray(length)
+        for index in range(length):
+            hi = int(digits[2 * index]) if 2 * index < len(digits) else 0
+            lo_index = 2 * index + 1
+            lo = int(digits[lo_index]) if lo_index < len(digits) else 0
+            out[index] = (hi << 4) | lo
+        out[length - 1] = (out[length - 1] & 0xF0) | (
+            self.SIGN_MINUS if negative else self.SIGN_PLUS
+        )
+        self.write(addr, bytes(out))
+
+    def _decimal_overflow(self, what: str, address: int) -> None:
+        """Decimal overflow: CC 3 is already set; interrupt if the mask allows."""
+        if self.psw.pmask & 0x8:            # program mask bit 0
+            raise ProgramCheck(0x0A, what, address)
+
+    def _decimal_op(self, i: Instruction, op: str) -> None:
+        """Shared body of AP, SP, CP, ZAP, MP and DP.
+
+        Results never exceed the first operand's field: surplus high-order
+        digits are lost, which is a decimal overflow (GA22-7000-4, p. 147).
+        """
+        a1, a2 = self._ss_addrs(i)
+        l1 = i.l1 + 1
+        l2 = i.l2 + 1
+        capacity = 2 * l1 - 1
+
+        if op == "ZAP":
+            # "Only the second operand is checked for valid sign and digit
+            # codes" (p. 155).
+            value = self._decimal_in(a2, l2, "second operand")
+            overflow = abs(value) >= 10 ** capacity
+            self._decimal_out(a1, l1, value)
+        elif op == "CP":
+            left = self._decimal_in(a1, l1, "first operand")
+            right = self._decimal_in(a2, l2, "second operand")
+            self.cc = 0 if left == right else (1 if left < right else 2)
+            self.psw.ia = wrap24(i.address + i.length)
+            return
+        elif op in ("AP", "SP"):
+            left = self._decimal_in(a1, l1, "first operand")
+            right = self._decimal_in(a2, l2, "second operand")
+            # SUBTRACT DECIMAL negates the second operand's sign (p. 154).
+            value = left + right if op == "AP" else left - right
+            overflow = abs(value) >= 10 ** capacity
+            self._decimal_out(a1, l1, value)
+        elif op == "MP":
+            if l2 > 8 or l2 >= l1:
+                raise SpecificationException("MP multiplier too large", i.address)
+            left = self._decimal_in(a1, l1, "multiplicand")
+            right = self._decimal_in(a2, l2, "multiplier")
+            value = left * right
+            overflow = abs(value) >= 10 ** capacity
+            self._decimal_out(a1, l1, value)
+            # "Condition Code: The code remains unchanged" (p. 153).
+            self.psw.ia = wrap24(i.address + i.length)
+            if overflow:
+                self._decimal_overflow("MP overflow", i.address)
+            return
+        elif op == "DP":
+            if l2 > 8 or l2 >= l1:
+                raise SpecificationException("DP divisor too large", i.address)
+            dividend = self._decimal_in(a1, l1, "dividend")
+            divisor = self._decimal_in(a2, l2, "divisor")
+            if divisor == 0:
+                raise ProgramCheck(0x0B, "decimal divide by zero", i.address)
+            quotient, remainder = _trunc_divmod(dividend, divisor)
+            quotient_bytes = l1 - l2
+            if abs(quotient) >= 10 ** (2 * quotient_bytes - 1):
+                raise ProgramCheck(0x0B, "decimal divide quotient overflow", i.address)
+            self._decimal_out(a1, quotient_bytes, quotient)
+            self._decimal_out(a1 + quotient_bytes, l2, remainder)
+            self.psw.ia = wrap24(i.address + i.length)
+            return
+        else:  # pragma: no cover
+            raise OperationException(f"decimal op {op}", i.address)
+
+        value = self._decimal_in(a1, l1, "first operand") if op != "ZAP" else None
+        # Condition code from the stored result.
+        stored = self._decimal_in(a1, l1, "result")
+        if overflow:
+            self.cc = 3
+            self.psw.ia = wrap24(i.address + i.length)
+            self._decimal_overflow(f"{op} overflow", i.address)
+            return
+        self.cc = 0 if stored == 0 else (1 if stored < 0 else 2)
+        self.psw.ia = wrap24(i.address + i.length)
+
+    def op_AP(self, i: Instruction) -> None:
+        self._decimal_op(i, "AP")
+
+    def op_SP(self, i: Instruction) -> None:
+        self._decimal_op(i, "SP")
+
+    def op_CP(self, i: Instruction) -> None:
+        self._decimal_op(i, "CP")
+
+    def op_ZAP(self, i: Instruction) -> None:
+        self._decimal_op(i, "ZAP")
+
+    def op_MP(self, i: Instruction) -> None:
+        self._decimal_op(i, "MP")
+
+    def op_DP(self, i: Instruction) -> None:
+        self._decimal_op(i, "DP")
+
     def op_MVC(self, i: Instruction) -> None:
         dest, src = self._ss_addrs(i)
         n = i.l + 1
@@ -1329,12 +1468,6 @@ class CPU:
     op_EDMK = _privileged_ss
     op_SRP = _privileged_ss
     op_MVO = _privileged_ss
-    op_ZAP = _privileged_ss
-    op_CP = _privileged_ss
-    op_AP = _privileged_ss
-    op_SP = _privileged_ss
-    op_MP = _privileged_ss
-    op_DP = _privileged_ss
 
     # ---------------- helpers used by tests and the CLI ----------------
 

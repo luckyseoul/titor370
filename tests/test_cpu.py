@@ -549,10 +549,10 @@ def test_lra_is_privileged():
         run_one("LRA", fields=(1, 0, 0, 0x200))
 
 
-@pytest.mark.parametrize("name", ["AP", "SP", "MP", "DP", "ZAP", "CP"])
-def test_decimal_instructions_are_operation_exceptions_not_privileged(name):
-    # The decimal feature is not installed; that is an operation exception,
-    # not a privileged-operation exception.
+@pytest.mark.parametrize("name", ["ED", "EDMK", "SRP", "MVO"])
+def test_unimplemented_decimal_instructions_are_operation_exceptions(name):
+    # These parts of the decimal feature are not implemented; that is an
+    # operation exception, not a privileged-operation exception.
     from titor370.cpu import OperationException
 
     cpu = CPU()

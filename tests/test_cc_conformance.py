@@ -64,6 +64,9 @@ CC_SETS: dict[str, frozenset[int]] = {
     # CC 0 is absent from the manual's row.
     "SLR": frozenset({1, 2, 3}), "SL": frozenset({1, 2, 3}),
     "TS": frozenset({0, 1}),
+    # Decimal arithmetic (Appendix E, Decimal Instructions)
+    "AP": frozenset({0, 1, 2, 3}), "SP": frozenset({0, 1, 2, 3}),
+    "ZAP": frozenset({0, 1, 2, 3}), "CP": frozenset({0, 1, 2}),
     "TM": frozenset({0, 1, 3}),
     "TRT": frozenset({0, 1, 2}),
 }
@@ -78,6 +81,7 @@ CC_UNCHANGED: frozenset[str] = frozenset(
     MR M D DR MH
     SLL SRL SLDL SRDL
     MVI
+    MP DP
     """.split()
 )
 
@@ -172,6 +176,29 @@ def _sweep_shift(name: str, double: bool) -> set[int]:
 
 def _sweep_ss(name: str) -> set[int]:
     seen = set()
+    if name == "ZAP":
+        # ZAP can only overflow when the source is longer than the target.
+        cpu = _base()
+        cpu.write(0x200, bytes(2))
+        cpu.write(0x300, _pack(12345, 4))
+        cc = _run(cpu, name, (1, 3, 0, 0x200, 0, 0x300))
+        if cc is not None:
+            seen.add(cc)
+    # Packed decimal requires valid sign nibbles; sweep values, not random bytes.
+    if name in ("AP", "SP", "ZAP", "CP", "MP", "DP"):
+        for left in (0, 1, -1, 1234, -1234, 999, -999, 9999999, -9999999):
+            for right in (0, 1, -1, 7, -7, 100, 9999999):
+                l1 = 4 if name in ("AP", "SP", "ZAP", "CP") else 6
+                l2 = 2 if name in ("AP", "SP", "ZAP", "CP") else 2
+                first = _pack(left, l1)
+                second = _pack(right, l2)
+                cpu = _base()
+                cpu.write(0x200, first)
+                cpu.write(0x300, second)
+                cc = _run(cpu, name, (l1 - 1, l2 - 1, 0, 0x200, 0, 0x300))
+                if cc is not None:
+                    seen.add(cc)
+        return seen
     if name == "TRT":
         # A table that tags only the last byte of the field gives CC 2; one
         # that tags an earlier byte gives CC 1.
@@ -210,6 +237,16 @@ def _sweep_si(name: str) -> set[int]:
             if cc is not None:
                 seen.add(cc)
     return seen
+
+
+def _pack(value: int, length: int) -> bytes:
+    """Packed decimal, encoded independently of the emulator."""
+    digits = f"{abs(value):0{2 * length - 1}d}"[-max(1, 2 * length - 1):]
+    nibbles = [int(d) for d in digits] + [0xD if value < 0 else 0xC]
+    out = bytearray(length)
+    for index in range(length):
+        out[index] = (nibbles[2 * index] << 4) | nibbles[2 * index + 1]
+    return bytes(out)
 
 
 def _sweep_long(name: str) -> set[int]:
@@ -367,7 +404,14 @@ def _run_preserving(name: str) -> bool | None:
         elif fmt is Fmt.SI:
             fields = (0x00, 0, 0x200)
         elif fmt is Fmt.SS:
-            fields = (3, 0, 0x200, 0, 0x300)
+            if name in ("MP", "DP"):
+                cpu.write(0x200, _pack(100, 5))
+                cpu.write(0x300, _pack(3, 1))
+                fields = (4, 0, 0, 0x200, 0, 0x300)
+            else:
+                cpu.write(0x200, _pack(1, 4))
+                cpu.write(0x300, _pack(1, 4))
+                fields = (3, 3, 0, 0x200, 0, 0x300)
         else:
             fields = (0, 0x200)
         cpu.load(0x1000, encode(name, *fields))
