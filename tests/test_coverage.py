@@ -15,7 +15,7 @@ from titor370.translate import emit
 
 # Instructions the interpreter runs but the C translator does not emit.
 # Keep in sync with the README's "Limits" section.
-NOT_TRANSLATED = {"SVC", "EX", "LPSW", "SSM", "LRA", "ED", "EDMK"}
+NOT_TRANSLATED = {"SVC", "EX", "LPSW", "SSM", "LRA"}
 
 
 def _synthetic(name: str) -> Instruction:

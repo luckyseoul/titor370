@@ -1416,10 +1416,9 @@ class CPU:
     def _edit(self, i: Instruction, mark: bool) -> None:
         """EDIT / EDIT AND MARK.
 
-        The pattern (first operand) is zoned text; the source (second operand)
-        is packed decimal. Sixteen pattern bytes are examined, each replaced by
-        the fill character, a zoned source digit, or left as message text,
-        depending on the significance indicator (GA22-7000-4, pp. 150-152).
+        The length field applies only to the pattern; source bytes are fetched
+        on demand, two digits at a time, except that a byte whose low-order
+        nibble is a sign code yields only one digit (GA22-7000-4, p. 151).
         """
         pattern, source = self._ss_addrs(i)
         length = i.l1 + 1
@@ -1430,23 +1429,28 @@ class CPU:
         DIGIT_SELECTOR, SIGNIFICANCE_STARTER, FIELD_SEPARATOR = 0x20, 0x21, 0x22
         fill = pattern_bytes[0]
 
-        # Unpack the source into (digit, plus_sign) pairs.
-        source_nibbles: list[tuple[int, bool]] = []
-        for byte in self.read(source, i.l2 + 1):
+        src_pos = 0
+        pending: tuple[int, bool] | None = None
+
+        def next_digit() -> tuple[int, bool]:
+            nonlocal src_pos, pending
+            if pending is not None:
+                out, pending = pending, None
+                return out
+            byte = self.fetch_byte(source + src_pos, i.address)
+            src_pos += 1
             hi, lo = byte >> 4, byte & 0x0F
             if hi > 9:
                 raise ProgramCheck(0x07, "invalid packed digit in EDIT source", i.address)
             if lo in self.PLUS_SIGNS:
-                source_nibbles.append((hi, True))
-            elif lo in self.MINUS_SIGNS:
-                source_nibbles.append((hi, False))
-            else:
-                if lo > 9:
-                    raise ProgramCheck(0x07, "invalid packed digit in EDIT source", i.address)
-                source_nibbles.append((hi, False))
-                source_nibbles.append((lo, False))
+                return hi, True
+            if lo in self.MINUS_SIGNS:
+                return hi, False
+            if lo > 9:
+                raise ProgramCheck(0x07, "invalid packed digit in EDIT source", i.address)
+            pending = (lo, False)
+            return hi, False
 
-        cursor = 0
         indicator = False
         field_nonzero = False
         result = bytearray(length)
@@ -1454,34 +1458,17 @@ class CPU:
         for index, char in enumerate(pattern_bytes):
             if char == DIGIT_SELECTOR or char == SIGNIFICANCE_STARTER:
                 was_off = not indicator
-                if cursor >= len(source_nibbles):
-                    digit, plus = 0, False
-                else:
-                    digit, plus = source_nibbles[cursor]
-                    cursor += 1
+                digit, plus = next_digit()
                 if digit:
                     field_nonzero = True
-
-                # Summary table, p. 152.
-                if char == DIGIT_SELECTOR:
-                    if not indicator and digit == 0:
-                        result[index] = fill
-                    elif not indicator and digit:
-                        result[index] = 0xF0 | digit
-                        indicator = not plus
-                    else:
-                        result[index] = 0xF0 | digit
-                        indicator = not plus
-                else:  # significance starter
-                    if digit == 0:
-                        result[index] = fill
-                    else:
-                        result[index] = 0xF0 | digit
-                        indicator = not plus
-                if mark and was_off and (0xF0 | digit) == result[index] and digit:
-                    # "whenever the result character is a zoned source digit
-                    # and the significance indicator was off before the
-                    # examination" (p. 153)
+                if (char == DIGIT_SELECTOR and was_off and digit == 0) or (
+                    char == SIGNIFICANCE_STARTER and digit == 0
+                ):
+                    result[index] = fill
+                else:
+                    result[index] = 0xF0 | digit
+                    indicator = not plus
+                if mark and was_off and digit:
                     self.r[1] = (self.r[1] & 0xFF000000) | (pattern + index)
             elif char == FIELD_SEPARATOR:
                 result[index] = fill
@@ -1490,13 +1477,8 @@ class CPU:
             else:
                 result[index] = char if indicator else fill
 
-        # "The filler character replaces the pattern character" only where the
-        # indicator is off; message characters survive while it is on.
         self.write(pattern, bytes(result))
-        if not field_nonzero:
-            self.cc = 0
-        else:
-            self.cc = 1 if indicator else 2
+        self.cc = 0 if not field_nonzero else (1 if indicator else 2)
         self.psw.ia = wrap24(i.address + i.length)
 
     def op_ED(self, i: Instruction) -> None:

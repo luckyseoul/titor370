@@ -208,7 +208,7 @@ The raw OCR rows are kept in `tools/pop_opcodes_ocr.json` for audit.
 
 ```
 $ python3 -m pytest -q
-971 passed
+972 passed
 ```
 
 Three kinds of test:
@@ -282,6 +282,7 @@ make the interpreter and the translator disagree if either is wrong.
 | `packed.s370` | CVD/CVB, PACK/UNPK, ICM/STCM, 64-bit shift, compare-and-swap |
 | `decimal.s370` | packed-decimal arithmetic |
 | `decimal2.s370` | decimal sweep including `MVO` and `SRP`, translated and compared |
+| `edit.s370` | EDIT and EDIT AND MARK |
 | `mvcl.s370` | MOVE LONG with padding, COMPARE LOGICAL LONG |
 | `cds.s370` | COMPARE DOUBLE AND SWAP |
 | `shifts.s370` | shift amounts of 32 and above, arithmetic vs logical |
@@ -300,7 +301,7 @@ make the interpreter and the translator disagree if either is wrong.
   `BALR r,0` are propagated so ordinary `USING`-style code resolves correctly.
 - **No decimal arithmetic.** `AP`/`SP`/`MP`/`DP`/`ZAP` and friends are unimplemented; `PACK`,
   `UNPK`, `CVD` and `CVB` are implemented and tested.
-- **Not translated:** SVC, EX, LPSW, SSM, LRA, ED, EDMK. The interpreter runs these (or
+- **Not translated:** SVC, EX, LPSW, SSM, LRA. The interpreter runs these (or
   raises for the privileged ones); the C translator does not emit code for them, and
   `tests/test_coverage.py` fails if this list and the code disagree.
 - **Self-modifying programs are not translated.** The generated C checks every store against

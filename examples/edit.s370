@@ -1,0 +1,11 @@
+*        EDIT and EDIT AND MARK: expand packed digits into a zoned pattern.
+         ORG   0x1000
+START    BALR  12,0
+         USING *,12
+         ED    PAT(6),NUM     ; length applies to the pattern
+         EDMK  PAT2(6),NUM    ; source bytes are fetched on demand
+         DIAG  0,0,0
+PAT      DC    X'404040404040'
+PAT2     DC    X'404040404040'
+NUM      DC    X'01234C'
+         END   START

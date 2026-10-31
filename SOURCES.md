@@ -48,6 +48,9 @@ where reliable, page images where the OCR was poor):
 | shifts | Shift amount is the low six bits of the *second-operand address*; B2 participates | 139 |
 | shifts | Amounts 31–63 shift the whole field out: 0 for positive, −1 for negative | 140 |
 | `MVC` | Result is as if each byte is stored immediately after the operand byte is fetched | 133 |
+| `ED` / `EDMK` | Fill character, digit selector, significance starter, field separator, message character; source digits fetched on demand, two per byte except where the low nibble is a sign; EDMK marks the first significant position | 150-153 |
+| `MVO` | Second operand offset four bit positions above the first operand's low nibble; no code checking | 135 |
+| `SRP` | Six-bit signed shift in the second-operand address; right shifts rounded by I3 with carry propagation; left-shift overflow raises decimal overflow | 153-154 |
 | `AP SP MP DP ZAP CP` | Packed operands; results never exceed the first field (overflow loses high digits); preferred sign codes C and D; `MP`/`DP` require L2 < L1 | 147-155 |
 | `PACK` | Sign comes from the zone over the low-order digit; field is right-aligned; **L1 and L2 are separate fields** | 137, 146 |
 | `UNPK` | Inverse of PACK; sign occupies the zone of the low-order byte | 146 |

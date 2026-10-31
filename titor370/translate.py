@@ -129,6 +129,54 @@ static void dec_out(uint32_t addr, unsigned len, int64_t value, unsigned at)
         (uint8_t)((M[(addr + len - 1) & MASK24] & 0xF0u) | (value < 0 ? 0xD : 0xC));
 }
 
+/* EDIT / EDIT AND MARK, mirroring the interpreter: source bytes are fetched
+ * on demand, two digits at a time, except where the low nibble is a sign. */
+static void edit_op(uint32_t pattern, uint32_t source, unsigned len,
+                    uint32_t *mark, unsigned at)
+{
+    uint8_t pat[256];
+    if (len > sizeof pat) unimplemented(at, "EDIT pattern too long");
+    for (unsigned i = 0; i < len; i++) pat[i] = M[(pattern + i) & MASK24];
+    uint8_t fill = pat[0];
+
+    unsigned src_pos = 0;
+    int have_pending = 0; unsigned pending_d = 0;
+    int ind = 0, field_nz = 0;
+
+    for (unsigned i = 0; i < len; i++) {
+        uint8_t ch = pat[i];
+        if (ch == 0x20 || ch == 0x21) {
+            unsigned d; int pl;
+            if (have_pending) { d = pending_d; pl = 0; have_pending = 0; }
+            else {
+                uint8_t b = M[(source + src_pos) & MASK24];
+                src_pos++;
+                unsigned hi = b >> 4, lo = b & 0x0F;
+                if (hi > 9) unimplemented(at, "invalid EDIT source digit");
+                d = hi;
+                if (lo == 0xA || lo == 0xC || lo == 0xE || lo == 0xF) pl = 1;
+                else if (lo == 0xB || lo == 0xD) pl = 0;
+                else {
+                    if (lo > 9) unimplemented(at, "invalid EDIT source digit");
+                    have_pending = 1; pending_d = lo; pl = 0;
+                }
+            }
+            int was_off = !ind;
+            if (d) field_nz = 1;
+            if (((ch == 0x20) && was_off && d == 0) || ((ch == 0x21) && d == 0))
+                pat[i] = fill;
+            else { pat[i] = (uint8_t)(0xF0 | d); ind = !pl; }
+            if (mark && was_off && d) *mark = (*mark & 0xFF000000u) | ((pattern + i) & MASK24);
+        } else if (ch == 0x22) {
+            pat[i] = fill; ind = 0; field_nz = 0;
+        } else {
+            pat[i] = ind ? ch : fill;
+        }
+    }
+    for (unsigned i = 0; i < len; i++) M[(pattern + i) & MASK24] = pat[i];
+    CC = !field_nz ? 0 : (ind ? 1 : 2);
+}
+
 static void store_guard(uint32_t addr, unsigned len)
 {
     uint32_t lo = addr & MASK24, hi = lo + len;
@@ -950,6 +998,13 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
             nxt,
         ]
 
+    if name == "ED" or name == "EDMK":
+        mark = f"&R[1]" if name == "EDMK" else "0"
+        return out + [
+            f"edit_op({D1}, {D2}, {L1 + 1}u, {mark}, 0x{ins.address:06X}u);",
+            nxt,
+        ]
+
     if name == "DIAG":
         return out + ["goto done;"]
 
@@ -957,7 +1012,7 @@ def emit(ins: Instruction, bases: dict[int, set[int]] | None = None,
         return out + [f'unimplemented(0x{ins.address:06X}u, "SVC is not translated");']
 
     # Instructions the interpreter implements but the translator does not.
-    if name in ("EX", "SSM", "LPSW", "LRA", "ED", "EDMK"):
+    if name in ("EX", "SSM", "LPSW", "LRA"):
         return out + [f'unimplemented(0x{ins.address:06X}u, "{name} is not translated");']
 
     return out + [f'unimplemented(0x{ins.address:06X}u, "{name}");']
