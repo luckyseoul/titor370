@@ -185,6 +185,9 @@ make the interpreter and the translator disagree if either is wrong.
   `BALR r,0` are propagated so ordinary `USING`-style code resolves correctly.
 - **No decimal arithmetic.** `AP`/`SP`/`MP`/`DP`/`ZAP` and friends are unimplemented; `PACK`,
   `UNPK`, `CVD` and `CVB` are implemented and tested.
+- **Not translated:** SVC, MVCL, CLCL, EX, CDS, LPSW, SSM. The interpreter runs these (or
+  raises for the privileged ones); the C translator does not emit code for them, and
+  `tests/test_coverage.py` fails if this list and the code disagree.
 
 ## Why this exists
 

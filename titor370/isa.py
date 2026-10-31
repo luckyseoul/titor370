@@ -83,6 +83,7 @@ OPCODES: dict[str, tuple[int, Fmt]] = {
     "AL": (0x5E, Fmt.RX),
     "SL": (0x5F, Fmt.RX),
     # ---- RS ----
+    "LRA": (0xB1, Fmt.RX),
     "BXH": (0x86, Fmt.RS),
     "BXLE": (0x87, Fmt.RS),
     "SRL": (0x88, Fmt.RS),
