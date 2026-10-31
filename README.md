@@ -10,7 +10,7 @@ The first half of that is false, and [the documentation
 says so](https://github.com/luckyseoul/ibm-5100-docs): the 5100 ran IBM's System/370 *APL
 implementation* on a microcoded interpreter; it never executed S/370 instructions. The second
 half is the interesting part — nobody has ever had software that translates S/370 machine code
-into a modern language and *proves* the translation is faithful.
+into a modern language, and checks that the translation matches the machine it came from.
 
 This repository is that software. It is a real System/370 machine, written to be verified
 rather than admired.
@@ -91,8 +91,9 @@ CVD CVB`, `EX BAL BCT BC LRA`, `SLL SRL SLA SRA SLDL SRDL SLDA SRDA STM LM BXH B
 CLM STCM ICM`, `TM MVI NI OI XI CLI`, `MVC MVN MVZ NC OC XC CLC TR TRT PACK UNPK`, `TS DIAG`.
 
 Deliberately **not** implemented, and they raise a program check rather than pretending:
-`SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH`, the decimal arithmetic instructions
-(`AP SP MP DP ZAP CP ED EDMK SRP MVO`), `LPSW` and `SSM` (privileged), and DAT.
+`SPM SSK ISK WRD RDD STNSM STOSM SIO TIO HIO TCH`; the decimal arithmetic instructions
+(`AP SP MP DP ZAP CP ED EDMK SRP MVO`); **all floating point**, which the 5100 did not have
+either; `LPSW` and `SSM` (privileged); and DAT.
 
 ## Design notes worth knowing
 
@@ -240,7 +241,8 @@ one mainframe APL implementation, which is a genuinely remarkable thing that is 
 thing as emulating a mainframe.
 
 This repository builds the thing the myth described, so the difference is measurable: one runs
-on a laptop and proves its own correctness, and the other never existed.
+on a laptop and is checked against itself and an external review, and the other never
+existed.
 
 The companion documentation dossier is
 [luckyseoul/ibm-5100-docs](https://github.com/luckyseoul/ibm-5100-docs) — with the primary
