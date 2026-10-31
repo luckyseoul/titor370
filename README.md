@@ -137,13 +137,16 @@ Three kinds of test:
   …), plus random 64-bit products and divisions. 320 checks that cannot agree with the
   emulator by accident.
 - **Differential fuzzing** (`tools/fuzz_diff.py`) — generates random straight-line programs,
-  runs them through both paths, and compares. 340 generated programs across five seeds agree;
-  roughly a quarter are skipped because they take a program check (divide by zero, odd
-  first operand), which the C path is documented not to model.
+  runs each through both paths, and compares all registers, the condition code and 4 KiB of
+  storage.
 
 ```bash
-python3 tools/fuzz_diff.py --iterations 150 --seed 999
+for s in 1 7 11 23 42; do python3 tools/fuzz_diff.py --iterations 40 --seed $s; done
 ```
+
+  Latest run: **200 programs, 0 mismatches, 46 skipped.** The skips take a program check
+  (divide by zero, odd first operand) which the C path is documented not to model, so they are
+  counted rather than quietly passing.
 
 The example programs' expected results come from Python's own arithmetic
 (`sum([10,20,30,40,50])`, `math.factorial(10)`, `"HELLO WORLD".encode("cp037")`), not from the
